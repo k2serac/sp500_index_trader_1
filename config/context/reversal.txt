@@ -1,0 +1,35 @@
+# Learnings for the intraday S&P 500 reversal strategy.
+
+[ALWAYS]
+- The first 30 minutes after the open (09:30–10:00 ET) are high-noise chop — never
+  recommend GO during this window regardless of signal count.
+- Macro-driven selloffs (CPI, PPI, Fed, geopolitical shocks) follow a typical pattern:
+  open down → morning selloff → exhaustion bottom (often 11:00–11:30 ET) → recovery.
+  This is the highest-probability setup for this strategy.
+- A TICK reading below -1000 followed by a snap above +200 is a stronger flush signal
+  than a -800 to +100 reading — weight accordingly.
+- On trend days (market making lower lows throughout the session with no bounces), this
+  strategy does not apply — return GO: false and explain it is a trend day, not a
+  mean-reversion day.
+- If the VIX is making new session highs at the time of the signal, panic is not
+  exhausted — return GO: false.
+- 11:00–11:30 ET is classically where institutional algorithms end morning positioning.
+  Setups that trigger near this window have higher historical success rates.
+- A 5-minute candle that closes ABOVE the high of the lowest candle (the "hammer bar")
+  is the structural confirmation — without this, the candle structure condition is not met.
+
+[PERISCOPE_SCREENSHOT]
+- When a Periscope screenshot is provided, look for:
+  * Large green GEX bars at or near the current price — these act as dealer-bid support
+  * The gamma flip level — above it dealers amplify moves up; below it they amplify down
+  * Net MM positioning switching from net short gamma to net long gamma at the low
+- If the screenshot is unclear, blurry, or cropped such that the key levels are not
+  visible, state that in REASONING and base the verdict on the numeric signals only.
+- Periscope shows data in 10-minute buckets — confirm the screenshot timestamp aligns
+  with the signal time before drawing conclusions.
+
+[RISK]
+- Never recommend a stop more than 0.5% below entry — the strategy targets tight
+  risk with asymmetric reward.
+- The default target is the prior session close or the opening price, whichever is
+  closer. Do not project targets beyond that level.

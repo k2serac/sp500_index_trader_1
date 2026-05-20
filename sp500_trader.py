@@ -1,0 +1,256 @@
+"""
+S&P 500 Index Trader — main entry point.
+
+Monitors intraday SPY price action via IBKR Market Data, detects mean-reversion
+setups using TICK, VIX, volume, and candle structure signals, and optionally
+calls Claude for a go/no-go verdict before placing a trade.
+
+Usage:
+    python sp500trader.py --mode demo   # paper trading via TWS (port 7497)
+    python sp500trader.py --mode live   # live trading via TWS  (port 7496)
+    python sp500trader.py --mode demo --dry-run   # full pipeline, no orders
+    python sp500trader.py --mode demo --verbose   # DEBUG logging
+"""
+
+import argparse
+import logging
+import time
+import tomllib
+from datetime import datetime, time as dt_time
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+from ib_async import IB
+
+from libs import MarketDataFeed, SignalEvaluator, ClaudeAnalyst, TradeManager, TradingJournal
+
+MARKET_TZ = ZoneInfo("America/New_York")
+
+# ---------------------------------------------------------------------------
+# Load config
+# ---------------------------------------------------------------------------
+
+_CONFIG_FILE = Path("config/config.toml")
+with open(_CONFIG_FILE, "rb") as _f:
+    _cfg = tomllib.load(_f)
+
+
+class _EasternFormatter(logging.Formatter):
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=MARKET_TZ)
+        return dt.strftime(datefmt or "%Y-%m-%d %H:%M:%S %Z")
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_EasternFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_handler])
+logger = logging.getLogger("sp500trader")
+
+# ---------------------------------------------------------------------------
+# Config constants
+# ---------------------------------------------------------------------------
+
+IBKR_HOST       = _cfg["ibkr"]["host"]
+IBKR_PORT_LIVE  = _cfg["ibkr"]["port_live"]
+IBKR_PORT_DEMO  = _cfg["ibkr"]["port_demo"]
+IBKR_CLIENT_ID  = _cfg["ibkr"]["client_id"]
+
+INSTRUMENT          = _cfg["trading"]["instrument"]
+MAX_AMM_PER_TRADE   = _cfg["trading"]["max_amm_per_trade"]
+STOP_BUFFER_PCT     = _cfg["trading"]["stop_buffer_pct"]
+TARGET_PCT          = _cfg["trading"]["target_pct"]
+TRADING_START_MIN   = _cfg["trading"]["trading_start_minutes"]
+TRADING_END_MIN     = _cfg["trading"]["trading_end_minutes"]
+
+LOOP_INTERVAL_SECS  = _cfg["signals"]["loop_interval_secs"]
+CANDLE_TF           = _cfg["signals"]["candle_timeframe"]
+TICK_LOW            = _cfg["signals"]["tick_low_threshold"]
+TICK_SNAP           = _cfg["signals"]["tick_snap_threshold"]
+VIX_DIV_BARS        = _cfg["signals"]["vix_divergence_bars"]
+VOL_BARS            = _cfg["signals"]["volume_exhaustion_bars"]
+SUPPORT_BUFFER_PCT  = _cfg["signals"]["support_buffer_pct"]
+
+USE_CLAUDE          = _cfg["claude"]["use_claude"]
+CLAUDE_MODEL        = _cfg["claude"]["model"]
+
+# RTH open/close (fixed)
+RTH_OPEN  = dt_time(9, 30)
+RTH_CLOSE = dt_time(16, 0)
+
+# Minimum conditions required to call Claude
+MIN_CONDITIONS_FOR_CLAUDE = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def is_rth(now: datetime) -> bool:
+    t = now.time()
+    return RTH_OPEN <= t < RTH_CLOSE
+
+
+def minutes_since_open(now: datetime) -> float:
+    open_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    return (now - open_dt).total_seconds() / 60
+
+
+def in_trading_window(now: datetime) -> bool:
+    if not is_rth(now):
+        return False
+    elapsed = minutes_since_open(now)
+    return TRADING_START_MIN <= elapsed <= TRADING_END_MIN
+
+
+def derive_support_levels(spy_price: float | None) -> list[float]:
+    """
+    Placeholder: returns round-number levels near the current SPY price.
+    Replace with actual GEX walls from a Periscope screenshot or manual input.
+    """
+    if spy_price is None:
+        return []
+    base = round(spy_price)
+    return [base - 2, base - 1, base, base + 1, base + 2]
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="S&P 500 Index Trader")
+    parser.add_argument("--mode", choices=["demo", "live"], default="demo")
+    parser.add_argument("--dry-run", action="store_true", help="Run pipeline without placing orders")
+    parser.add_argument("--verbose", action="store_true", help="DEBUG logging")
+    args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    port = IBKR_PORT_DEMO if args.mode == "demo" else IBKR_PORT_LIVE
+    logger.info("Starting in %s mode (IBKR port %d)%s.", args.mode.upper(), port,
+                " [DRY RUN]" if args.dry_run else "")
+
+    # Connect to IBKR
+    ib = IB()
+    ib.connect(IBKR_HOST, port, clientId=IBKR_CLIENT_ID)
+    logger.info("IBKR connected.")
+
+    # Initialise components
+    journal  = TradingJournal(bot_name="sp500trader")
+    feed     = MarketDataFeed(ib, candle_timeframe=CANDLE_TF)
+    evaluator = SignalEvaluator(
+        tick_low=TICK_LOW,
+        tick_snap=TICK_SNAP,
+        vix_divergence_bars=VIX_DIV_BARS,
+        volume_exhaustion_bars=VOL_BARS,
+        support_buffer_pct=SUPPORT_BUFFER_PCT,
+    )
+    analyst  = ClaudeAnalyst(model=CLAUDE_MODEL) if USE_CLAUDE else None
+    trader   = TradeManager(
+        ib=ib,
+        instrument=INSTRUMENT,
+        max_amm_per_trade=MAX_AMM_PER_TRADE,
+        stop_buffer_pct=STOP_BUFFER_PCT,
+        target_pct=TARGET_PCT,
+        journal=journal,
+    )
+
+    journal.log_session_start()
+    loop_count = 0
+
+    try:
+        while True:
+            loop_count += 1
+            now = datetime.now(MARKET_TZ)
+            logger.info("Loop #%d — %s", loop_count, now.strftime("%H:%M:%S ET"))
+
+            if not ib.isConnected():
+                logger.warning("IBKR disconnected — reconnecting...")
+                ib.connect(IBKR_HOST, port, clientId=IBKR_CLIENT_ID)
+
+            # --- Fetch market snapshot ---
+            snap = feed.snapshot()
+
+            # --- Monitor open position stops/targets ---
+            if trader.has_position and snap.spy_price is not None:
+                trader.check_stops_and_targets(snap.spy_price)
+
+            # --- Pre-close sweep: close all positions 5 min before RTH close ---
+            if now.time() >= dt_time(15, 55) and trader.has_position:
+                logger.info("Pre-close sweep — closing all positions.")
+                trader.close_all(reason="pre-close sweep")
+
+            # --- Only look for new entries within the trading window ---
+            if not in_trading_window(now):
+                logger.debug("Outside trading window — skipping signal evaluation.")
+                time.sleep(LOOP_INTERVAL_SECS)
+                continue
+
+            if trader.has_position:
+                time.sleep(LOOP_INTERVAL_SECS)
+                continue
+
+            # --- Update support levels (round numbers; replace with GEX data later) ---
+            evaluator.update_support_levels(derive_support_levels(snap.spy_price))
+
+            # --- Evaluate reversal signal ---
+            signal = evaluator.evaluate(snap)
+            if signal is None:
+                time.sleep(LOOP_INTERVAL_SECS)
+                continue
+
+            logger.debug("Signal: %d/5 conditions\n%s", signal.conditions_met, signal.summary())
+
+            if signal.conditions_met < MIN_CONDITIONS_FOR_CLAUDE:
+                time.sleep(LOOP_INTERVAL_SECS)
+                continue
+
+            logger.info("Potential reversal — %d/5 conditions met. Logging signal.", signal.conditions_met)
+            journal.log_signal(signal)
+
+            # --- Call Claude for go/no-go ---
+            if analyst is not None:
+                logger.info("Calling Claude for verdict...")
+                verdict = analyst.analyze(signal)
+                journal.log_claude_verdict(signal, verdict)
+                logger.info(
+                    "Claude verdict: GO=%s  confidence=%d/10  %s",
+                    verdict.go, verdict.confidence, verdict.reasoning,
+                )
+
+                if verdict.go and verdict.confidence >= 6:
+                    if args.dry_run:
+                        logger.info("[DRY RUN] Would place entry order.")
+                    else:
+                        trader.enter(signal, verdict)
+                else:
+                    logger.info("Claude said no — standing down.")
+            else:
+                # No Claude — apply a stricter threshold
+                if signal.conditions_met >= 5:
+                    logger.info("All 5 conditions met — placing trade without Claude.")
+                    if not args.dry_run:
+                        from libs.signal_lib import ClaudeVerdict
+                        auto_verdict = ClaudeVerdict(
+                            go=True, confidence=7,
+                            support_level=signal.support_level,
+                            stop_level=None, target_level=None,
+                            reasoning="All 5 conditions met — auto entry.",
+                            raw_response="",
+                        )
+                        trader.enter(signal, auto_verdict)
+
+            time.sleep(LOOP_INTERVAL_SECS)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted — shutting down.")
+    finally:
+        trader.close_all(reason="bot shutdown")
+        journal.log_session_stop()
+        ib.disconnect()
+        logger.info("Disconnected.")
+
+
+if __name__ == "__main__":
+    main()

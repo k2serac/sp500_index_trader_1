@@ -1,0 +1,44 @@
+# ---------------------------------------------------------------------------
+# S&P 500 Index Trader — central configuration
+# ---------------------------------------------------------------------------
+
+[ibkr]
+host      = "127.0.0.1"
+port_demo = 7497
+port_live = 7496
+client_id = 98          # must differ from us_stock_trader_1 (99)
+
+[trading]
+instrument        = "SPY"   # ETF traded; "ES" for futures (requires contract changes)
+max_active_trades = 1       # one position at a time
+max_amm_per_trade = 10000   # USD budget per trade
+stop_buffer_pct   = 0.20    # stop placed this % below the confirmed support level
+target_pct        = 0.50    # profit target this % above entry price
+
+# RTH trading window (minutes from 09:30 ET open)
+# Trades are only considered within this window.
+trading_start_minutes = 30   # skip first 30 min of open (high chop)
+trading_end_minutes   = 330  # stop new entries at 15:00 ET (330 min = 5.5 h)
+
+[signals]
+loop_interval_secs  = 60    # IBKR poll cadence (seconds)
+candle_timeframe    = 5     # bar size in minutes for structure analysis
+
+# NYSE TICK thresholds
+tick_low_threshold  = -800  # TICK must touch or breach this level
+tick_snap_threshold = 200   # TICK must then recover above this level
+
+# VIX divergence: VIX must NOT print a new high on the last N bars while price retests lows
+vix_divergence_bars = 3
+
+# Volume exhaustion: selling volume must be declining over the last N bars
+volume_exhaustion_bars = 3
+
+# Support proximity: price must be within this % of a tracked support level to qualify
+support_buffer_pct = 0.30
+
+[claude]
+use_claude = true
+model      = "claude-sonnet-4-6"
+prompts_dir = "config/prompts"
+context_dir = "config/context"
