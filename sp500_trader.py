@@ -18,13 +18,14 @@ import time
 import tomllib
 from datetime import datetime, time as dt_time
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from ib_async import IB
 
-from libs import MarketDataFeed, SignalEvaluator, ClaudeAnalyst, TradeManager, TradingJournal
-
-MARKET_TZ = ZoneInfo("America/New_York")
+from libs import (
+    MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
+    TradeManager, TradingJournal, open_uw_browser,
+    is_rth, minutes_since_open, in_trading_window, derive_support_levels,
+)
 
 # ---------------------------------------------------------------------------
 # Load config
@@ -73,44 +74,8 @@ SUPPORT_BUFFER_PCT  = _cfg["signals"]["support_buffer_pct"]
 USE_CLAUDE          = _cfg["claude"]["use_claude"]
 CLAUDE_MODEL        = _cfg["claude"]["model"]
 
-# RTH open/close (fixed)
-RTH_OPEN  = dt_time(9, 30)
-RTH_CLOSE = dt_time(16, 0)
-
 # Minimum conditions required to call Claude
 MIN_CONDITIONS_FOR_CLAUDE = 3
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def is_rth(now: datetime) -> bool:
-    t = now.time()
-    return RTH_OPEN <= t < RTH_CLOSE
-
-
-def minutes_since_open(now: datetime) -> float:
-    open_dt = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    return (now - open_dt).total_seconds() / 60
-
-
-def in_trading_window(now: datetime) -> bool:
-    if not is_rth(now):
-        return False
-    elapsed = minutes_since_open(now)
-    return TRADING_START_MIN <= elapsed <= TRADING_END_MIN
-
-
-def derive_support_levels(spy_price: float | None) -> list[float]:
-    """
-    Placeholder: returns round-number levels near the current SPY price.
-    Replace with actual GEX walls from a Periscope screenshot or manual input.
-    """
-    if spy_price is None:
-        return []
-    base = round(spy_price)
-    return [base - 2, base - 1, base, base + 1, base + 2]
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +95,8 @@ def main() -> None:
     port = IBKR_PORT_DEMO if args.mode == "demo" else IBKR_PORT_LIVE
     logger.info("Starting in %s mode (IBKR port %d)%s.", args.mode.upper(), port,
                 " [DRY RUN]" if args.dry_run else "")
+
+    open_uw_browser()
 
     # Connect to IBKR
     ib = IB()
@@ -182,7 +149,7 @@ def main() -> None:
                 trader.close_all(reason="pre-close sweep")
 
             # --- Only look for new entries within the trading window ---
-            if not in_trading_window(now):
+            if not in_trading_window(now, TRADING_START_MIN, TRADING_END_MIN):
                 logger.debug("Outside trading window — skipping signal evaluation.")
                 time.sleep(LOOP_INTERVAL_SECS)
                 continue

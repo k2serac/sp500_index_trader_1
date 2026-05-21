@@ -1,17 +1,71 @@
 """
 trade_lib.py — Trade execution and risk management for the S&P 500 reversal bot.
 
-TradeManager — Places, monitors, and closes SPY limit orders via IBKR.
+TradeManager   — Places, monitors, and closes SPY limit orders via IBKR.
+open_uw_browser — Opens UnusualWhales tabs in Firefox at bot startup.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import subprocess
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
+
+logger = logging.getLogger(__name__)
+
+_UW_BOOKMARK_FOLDER = "UnusualWhales"
+_CHROME_BOOKMARKS = Path.home() / ".config/google-chrome/Default/Bookmarks"
+
+_FALLBACK_TABS = [
+    "https://unusualwhales.com/flow/overview",
+    "https://unusualwhales.com/periscope/market-exposure",
+    "https://unusualwhales.com/periscope/delta-flow",
+]
+
+
+def _load_uw_bookmark_urls() -> list[str]:
+    """Return URLs from the Chrome bookmark folder named UnusualWhales."""
+    try:
+        data = json.loads(_CHROME_BOOKMARKS.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Could not read Chrome bookmarks: %s", exc)
+        return _FALLBACK_TABS
+
+    def find_folder(node: dict, name: str) -> dict | None:
+        if node.get("type") == "folder" and node.get("name") == name:
+            return node
+        for child in node.get("children", []):
+            result = find_folder(child, name)
+            if result:
+                return result
+        return None
+
+    for root in data.get("roots", {}).values():
+        folder = find_folder(root, _UW_BOOKMARK_FOLDER)
+        if folder:
+            urls = [c["url"] for c in folder.get("children", []) if c.get("type") == "url"]
+            if urls:
+                return urls
+
+    logger.warning("Bookmark folder '%s' not found — using fallback URLs.", _UW_BOOKMARK_FOLDER)
+    return _FALLBACK_TABS
+
+
+def open_uw_browser() -> None:
+    tabs = _load_uw_bookmark_urls()
+    try:
+        subprocess.Popen(["google-chrome", "--new-window"] + tabs)
+        logger.info("Opened UnusualWhales in Chrome (%d tabs).", len(tabs))
+    except FileNotFoundError:
+        logger.warning("Chrome not found — open UnusualWhales manually.")
+    except Exception as exc:
+        logger.warning("Could not open Chrome: %s", exc)
 
 from .signal_lib import ClaudeVerdict, ReversalSignal
 
