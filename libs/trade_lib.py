@@ -27,6 +27,14 @@ _FALLBACK_TABS = [
     "https://unusualwhales.com/flow/overview",
     "https://unusualwhales.com/periscope/market-exposure",
     "https://unusualwhales.com/periscope/delta-flow",
+    "https://unusualwhales.com/periscope/market-tide",
+]
+
+# These three tabs are always reloaded and screenshotted in live mode regardless of bookmarks.
+_REQUIRED_PERISCOPE_TABS = [
+    "https://unusualwhales.com/periscope/market-exposure",
+    "https://unusualwhales.com/periscope/delta-flow",
+    "https://unusualwhales.com/periscope/market-tide",
 ]
 
 # Populated by open_uw_browser() so capture_periscope_screenshots() knows which URLs to target.
@@ -64,6 +72,10 @@ def _load_uw_bookmark_urls() -> list[str]:
 def open_uw_browser() -> None:
     global _uw_tab_urls
     tabs = _load_uw_bookmark_urls()
+    # Ensure the three critical periscope tabs are always opened, even if absent from bookmarks.
+    for url in _REQUIRED_PERISCOPE_TABS:
+        if not any(t.startswith(url) for t in tabs):
+            tabs.append(url)
     _uw_tab_urls = tabs
 
     # Kill any leftover Chrome instance using the bot profile before starting fresh.
