@@ -21,12 +21,16 @@ logger = logging.getLogger(__name__)
 
 _UW_BOOKMARK_FOLDER = "UnusualWhales"
 _CHROME_BOOKMARKS = Path.home() / ".config/google-chrome/Default/Bookmarks"
+_CDP_PORT = 9222
 
 _FALLBACK_TABS = [
     "https://unusualwhales.com/flow/overview",
     "https://unusualwhales.com/periscope/market-exposure",
     "https://unusualwhales.com/periscope/delta-flow",
 ]
+
+# Populated by open_uw_browser() so capture_periscope_screenshots() knows which URLs to target.
+_uw_tab_urls: list[str] = []
 
 
 def _load_uw_bookmark_urls() -> list[str]:
@@ -58,14 +62,103 @@ def _load_uw_bookmark_urls() -> list[str]:
 
 
 def open_uw_browser() -> None:
+    global _uw_tab_urls
     tabs = _load_uw_bookmark_urls()
+    _uw_tab_urls = tabs
+
+    # Kill any leftover Chrome instance using the bot profile before starting fresh.
+    subprocess.run(
+        ["pkill", "-f", "chrome-sp500bot"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
     try:
-        subprocess.Popen(["google-chrome", "--new-window"] + tabs)
-        logger.info("Opened UnusualWhales in Chrome (%d tabs).", len(tabs))
+        subprocess.Popen(
+            ["google-chrome", "--new-window", f"--remote-debugging-port={_CDP_PORT}",
+             "--remote-allow-origins=*",
+             "--user-data-dir=" + str(Path.home() / ".config/chrome-sp500bot"),
+             "--no-first-run", "--no-default-browser-check",
+             "--hide-crash-restore-bubble"] + tabs
+        )
+        logger.info("Opened UnusualWhales in Chrome (%d tabs, CDP port %d).", len(tabs), _CDP_PORT)
     except FileNotFoundError:
         logger.warning("Chrome not found — open UnusualWhales manually.")
     except Exception as exc:
         logger.warning("Could not open Chrome: %s", exc)
+
+
+def capture_periscope_screenshots(snapshot_dir: Path | str) -> dict[str, Path]:
+    """Capture a screenshot of each UW tab via Chrome DevTools Protocol.
+
+    Returns a mapping of URL slug → saved file path for each tab captured.
+    Logs a warning and skips gracefully if CDP is not reachable or a tab hasn't loaded yet.
+    """
+    import base64
+    import json as _json
+    import time as _time
+    from urllib.parse import urlparse
+
+    import requests
+    import websocket
+
+    snapshot_dir = Path(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(MARKET_TZ).strftime("%Y%m%d_%H%M")
+    results: dict[str, Path] = {}
+
+    try:
+        cdp_tabs = requests.get(f"http://localhost:{_CDP_PORT}/json", timeout=5).json()
+    except Exception as exc:
+        logger.warning("CDP not reachable (Chrome may need --remote-debugging-port): %s", exc)
+        return results
+
+    # Build url → websocket debugger url for all open page tabs.
+    ws_by_url = {
+        t["url"]: t["webSocketDebuggerUrl"]
+        for t in cdp_tabs
+        if t.get("type") == "page" and "webSocketDebuggerUrl" in t
+    }
+
+    for tab_url in _uw_tab_urls:
+        # Match by prefix to tolerate query params or trailing slashes added by Chrome.
+        ws_url = next((ws for url, ws in ws_by_url.items() if url.startswith(tab_url)), None)
+        if ws_url is None:
+            logger.warning("UW tab not found in CDP — not yet loaded? (%s)", tab_url)
+            continue
+
+        path = urlparse(tab_url).path                               # "/periscope/market-exposure"
+        slug = path.strip("/").replace("/", "_").replace("-", "_")  # "periscope_market_exposure"
+        out_path = snapshot_dir / f"{timestamp}_{slug}.png"
+        ws_url_ip = ws_url.replace("localhost", "127.0.0.1")
+
+        for attempt in range(1, 4):
+            try:
+                ws = websocket.create_connection(ws_url_ip, timeout=30)
+                try:
+                    ws.send(_json.dumps({"id": 1, "method": "Page.captureScreenshot",
+                                         "params": {"format": "png"}}))
+                    while True:
+                        msg = _json.loads(ws.recv())
+                        if msg.get("id") == 1:
+                            if "error" in msg:
+                                raise RuntimeError(msg["error"].get("message", "CDP error"))
+                            out_path.write_bytes(base64.b64decode(msg["result"]["data"]))
+                            logger.info("Periscope screenshot saved: %s", out_path.name)
+                            results[slug] = out_path
+                            break
+                finally:
+                    ws.close()
+                break  # success — no more retries needed
+            except Exception as exc:
+                if attempt < 3:
+                    logger.warning("Screenshot attempt %d/3 failed for %s: %s — retrying in 5 s.",
+                                   attempt, tab_url, exc)
+                    _time.sleep(5)
+                else:
+                    logger.warning("Screenshot failed for %s after 3 attempts: %s", tab_url, exc)
+
+    return results
 
 from .signal_lib import ClaudeVerdict, ReversalSignal
 

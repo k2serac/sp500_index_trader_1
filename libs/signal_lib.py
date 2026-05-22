@@ -291,13 +291,22 @@ class ClaudeAnalyst:
     def analyze(
         self,
         signal: ReversalSignal,
+        periscope_data=None,          # PeriscopeData | None
         periscope_screenshot_path: str | None = None,
     ) -> ClaudeVerdict:
         user_content: list = []
 
         context_block = f"<context>\n{self._context}\n</context>\n\n" if self._context else ""
+
+        periscope_block = ""
+        if periscope_data is not None:
+            periscope_block = (
+                f"<periscope>\n{periscope_data.summary()}\n</periscope>\n\n"
+            )
+
         text_block = (
             f"{context_block}"
+            f"{periscope_block}"
             f"Signal detected at {signal.timestamp.strftime('%H:%M ET')}:\n\n"
             f"{signal.summary()}"
         )
@@ -313,7 +322,7 @@ class ClaudeAnalyst:
                     "type": "image",
                     "source": {"type": "base64", "media_type": media_type, "data": img_data},
                 })
-                user_content.append({"type": "text", "text": "Periscope screenshot attached above."})
+                user_content.append({"type": "text", "text": "Periscope Market Maker Exposure screenshot attached above."})
             except Exception as exc:
                 logger.warning("Could not load screenshot %s: %s", periscope_screenshot_path, exc)
 

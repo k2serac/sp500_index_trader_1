@@ -1,4 +1,5 @@
 from .signal_lib import MarketDataFeed, SignalEvaluator, ClaudeAnalyst
-from .trade_lib import TradeManager, open_uw_browser
+from .trade_lib import TradeManager, open_uw_browser, capture_periscope_screenshots
 from .journal_lib import TradingJournal
-from .utils import is_rth, minutes_since_open, in_trading_window, derive_support_levels
+from .periscope_lib import PeriscopeReader, PeriscopeData
+from .utils import is_rth, minutes_since_open, in_trading_window, in_periscope_window, derive_support_levels

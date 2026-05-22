@@ -42,3 +42,7 @@ use_claude = true
 model      = "claude-sonnet-4-6"
 prompts_dir = "config/prompts"
 context_dir = "config/context"
+
+[periscope]
+# Screenshots taken 1 min after each 10-min Periscope update (:01, :11, :21, ...)
+snapshot_dir = "periscope_snapshots"

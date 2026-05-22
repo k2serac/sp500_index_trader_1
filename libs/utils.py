@@ -12,6 +12,15 @@ MARKET_TZ = ZoneInfo("America/New_York")
 RTH_OPEN  = dt_time(9, 30)
 RTH_CLOSE = dt_time(16, 0)
 
+# First screenshot at 9:21 — 1 min after the 9:20 Periscope update, before RTH open.
+PERISCOPE_SNAPSHOT_START = dt_time(9, 21)
+
+
+def in_periscope_window(now: datetime) -> bool:
+    """True during the window when Periscope screenshots should be taken."""
+    t = now.time()
+    return PERISCOPE_SNAPSHOT_START <= t < RTH_CLOSE
+
 
 def is_rth(now: datetime) -> bool:
     t = now.time()

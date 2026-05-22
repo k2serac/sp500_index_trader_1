@@ -19,12 +19,15 @@ import tomllib
 from datetime import datetime, time as dt_time
 from pathlib import Path
 
+import pandas as pd
 from ib_async import IB
+from trading_common.trade_lib import TradeHour
 
 from libs import (
     MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
-    TradeManager, TradingJournal, open_uw_browser,
-    is_rth, minutes_since_open, in_trading_window, derive_support_levels,
+    TradeManager, TradingJournal, open_uw_browser, capture_periscope_screenshots,
+    PeriscopeReader,
+    is_rth, minutes_since_open, in_trading_window, in_periscope_window,
 )
 
 # ---------------------------------------------------------------------------
@@ -74,6 +77,8 @@ SUPPORT_BUFFER_PCT  = _cfg["signals"]["support_buffer_pct"]
 USE_CLAUDE          = _cfg["claude"]["use_claude"]
 CLAUDE_MODEL        = _cfg["claude"]["model"]
 
+PERISCOPE_DIR = Path(_cfg["periscope"]["snapshot_dir"])
+
 # Minimum conditions required to call Claude
 MIN_CONDITIONS_FOR_CLAUDE = 3
 
@@ -114,6 +119,7 @@ def main() -> None:
         support_buffer_pct=SUPPORT_BUFFER_PCT,
     )
     analyst  = ClaudeAnalyst(model=CLAUDE_MODEL) if USE_CLAUDE else None
+    periscope_reader = PeriscopeReader(model=CLAUDE_MODEL)
     trader   = TradeManager(
         ib=ib,
         instrument=INSTRUMENT,
@@ -123,13 +129,53 @@ def main() -> None:
         journal=journal,
     )
 
+    trade_hour = TradeHour()
     journal.log_session_start()
     loop_count = 0
+    last_screenshot_window: datetime | None = None  # tracks the last 10-min bucket screenshotted
+    latest_periscope_data = None
+    latest_periscope_shots: dict = {}
 
     try:
         while True:
             loop_count += 1
             now = datetime.now(MARKET_TZ)
+
+            # --- Idle sleep: only active 9:21–16:00 ET on trading days ---
+            if not in_periscope_window(now) or not trade_hour.is_trading_day():
+                # Search for next trading day from today if before 9:21, else from tomorrow
+                # (handles the after-16:00 case where today's 9:20 is already in the past).
+                search_from = 0 if now.time() < dt_time(9, 21) else 1
+                wake_at = None
+                for offset in range(search_from, search_from + 8):
+                    candidate = now + pd.Timedelta(days=offset)
+                    if trade_hour.is_trading_day(candidate):
+                        wake_at = candidate.replace(hour=9, minute=20, second=0, microsecond=0)
+                        break
+
+                if wake_at is None:
+                    wake_at = now + pd.Timedelta(days=7)  # safety fallback
+
+                secs = (wake_at - now).total_seconds()
+                if secs > LOOP_INTERVAL_SECS:
+                    logger.info("Market inactive — sleeping until %s (%.1f hr).",
+                                wake_at.strftime("%Y-%m-%d %H:%M ET"), secs / 3600)
+                    time.sleep(secs)
+                    continue
+
+            # --- Periscope screenshots at :01, :11, :21 ... from 9:21 until market close ---
+            # Periscope updates on the 10-min mark; we wait 1 min for data to settle.
+            current_window = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
+            if in_periscope_window(now) and now.minute % 10 == 1 and current_window != last_screenshot_window:
+                shots = capture_periscope_screenshots(PERISCOPE_DIR)
+                last_screenshot_window = current_window
+                if shots:
+                    periscope_data = periscope_reader.read(shots)
+                    if periscope_data is not None:
+                        latest_periscope_data = periscope_data
+                        latest_periscope_shots = shots
+                        logger.info("Periscope update:\n%s", periscope_data.summary())
+                        evaluator.update_support_levels(periscope_data.all_key_levels())
             logger.info("Loop #%d — %s", loop_count, now.strftime("%H:%M:%S ET"))
 
             if not ib.isConnected():
@@ -158,9 +204,6 @@ def main() -> None:
                 time.sleep(LOOP_INTERVAL_SECS)
                 continue
 
-            # --- Update support levels (round numbers; replace with GEX data later) ---
-            evaluator.update_support_levels(derive_support_levels(snap.spy_price))
-
             # --- Evaluate reversal signal ---
             signal = evaluator.evaluate(snap)
             if signal is None:
@@ -179,7 +222,12 @@ def main() -> None:
             # --- Call Claude for go/no-go ---
             if analyst is not None:
                 logger.info("Calling Claude for verdict...")
-                verdict = analyst.analyze(signal)
+                exposure_path = latest_periscope_shots.get("periscope_market_exposure")
+                verdict = analyst.analyze(
+                    signal,
+                    periscope_data=latest_periscope_data,
+                    periscope_screenshot_path=str(exposure_path) if exposure_path else None,
+                )
                 journal.log_claude_verdict(signal, verdict)
                 logger.info(
                     "Claude verdict: GO=%s  confidence=%d/10  %s",
