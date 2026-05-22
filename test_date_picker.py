@@ -3,7 +3,8 @@ Test date + hour anchor navigation on UnusualWhales Periscope via CDP.
 
 Usage:
     python test_date_picker.py              # probe anchors + date navigation
-    python test_date_picker.py --history    # capture today at each available anchor hour
+    python test_date_picker.py --history    # capture today: market-exposure at each anchor
+                                            # hour + market-tide once
 """
 
 import sys
@@ -17,7 +18,7 @@ from libs.trade_lib import (
     _cdp_tabs, _cdp_evaluate,
     select_periscope_datetime, capture_periscope_historical,
     _JS_GET_PERISCOPE_DATE, _JS_GET_CHART_HOUR_LINKS,
-    _PERISCOPE_MARKET_EXPOSURE_URL, _chart_label_to_hour,
+    _PERISCOPE_MARKET_EXPOSURE_URL, _PERISCOPE_MARKET_TIDE_URL, _chart_label_to_hour,
 )
 
 JS_GET_TIMEFRAME = r"""

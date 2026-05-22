@@ -26,7 +26,7 @@ from trading_common.trade_lib import TradeHour
 from libs import (
     MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
     TradeManager, TradingJournal, open_uw_browser, capture_periscope_screenshots,
-    select_periscope_datetime,
+    select_periscope_datetime, select_periscope_date_all,
     PeriscopeReader,
     is_rth, minutes_since_open, in_trading_window, in_periscope_window,
 )
@@ -105,7 +105,7 @@ def main() -> None:
     open_uw_browser()
     # Give Chrome time to load before we try to interact with it via CDP.
     time.sleep(15)
-    select_periscope_datetime(target_date=date.today())
+    select_periscope_date_all(target_date=date.today())
 
     # Connect to IBKR
     ib = IB()

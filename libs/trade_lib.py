@@ -135,13 +135,25 @@ def _cdp_ws_for_tab(tab_url: str) -> str | None:
 
 
 _PERISCOPE_MARKET_EXPOSURE_URL = "https://unusualwhales.com/periscope/market-exposure"
+_PERISCOPE_MARKET_TIDE_URL    = "https://unusualwhales.com/periscope/market-tide"
 
-_JS_GET_PERISCOPE_DATE = """
+_JS_GET_PERISCOPE_DATE = r"""
 (function() {
-    const span = document.querySelector('[data-testid="market-exposures-tick-chart"] span[role="button"]');
-    if (span) return span.innerText.trim();
-    const btn = document.querySelector('[data-testid="date-picker-button"]');
-    return btn ? btn.innerText.trim() : null;
+    const SELECTORS = [
+        '[data-testid="market-exposures-tick-chart"] span[role="button"]',
+        '[data-testid="date-picker-button"]',
+        'button[aria-label="date-picker"]',
+    ];
+    for (const sel of SELECTORS) {
+        const el = document.querySelector(sel);
+        if (el) return el.innerText.trim();
+    }
+    // Generic fallback: any button/span whose text looks like "Mon, Jan 1"
+    for (const el of document.querySelectorAll('button, span[role="button"]')) {
+        const t = (el.innerText || '').trim();
+        if (/^[A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2}$/.test(t)) return t;
+    }
+    return null;
 })()
 """
 
@@ -332,18 +344,19 @@ def _chart_label_to_hour(label: str) -> int | None:
 def select_periscope_datetime(
     target_date: date | None = None,
     target_hour: int | None = None,
+    tab_url: str = _PERISCOPE_MARKET_EXPOSURE_URL,
 ) -> bool:
-    """Navigate the Periscope market-exposure page to a specific date and/or hour anchor.
+    """Navigate a Periscope tab to a specific date and/or hour anchor.
 
+    tab_url:     CDP tab to target (default: market-exposure).
     target_date: trading date to display; None = leave as-is.
     target_hour: 24h hour (10-16 ET). Clicks the nearest rendered anchor ≤ target_hour.
-                 The chart renders anchor labels every 1-2 hours (10:00 AM, 12:00 PM …).
-                 Each anchor shows the 10-minute bucket ending at that hour.
+                 Only meaningful for market-exposure (market-tide has no hour anchors).
     Returns True if all requested navigation succeeded.
     """
     import time as _time
 
-    ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
+    ws_url = _cdp_ws_for_tab(tab_url)
     if not ws_url:
         return False
 
@@ -398,6 +411,13 @@ def select_periscope_datetime(
         logger.info("Periscope hour anchor clicked: %s", match["text"])
 
     return True
+
+
+def select_periscope_date_all(target_date: date) -> None:
+    """Navigate all known Periscope tabs (market-exposure and market-tide) to target_date."""
+    for url in [_PERISCOPE_MARKET_EXPOSURE_URL, _PERISCOPE_MARKET_TIDE_URL]:
+        if not select_periscope_datetime(target_date=target_date, tab_url=url):
+            logger.warning("Could not navigate %s to %s — tab may not be open yet.", url, target_date)
 
 
 def capture_periscope_screenshots(snapshot_dir: Path | str) -> dict[str, Path]:
@@ -513,6 +533,26 @@ def capture_periscope_historical(
             else:
                 logger.warning("capture_periscope_historical: screenshot failed for %s %02dh after 3 attempts.",
                                current, hour)
+
+        # --- Market Tide: one screenshot per day (date-only, no hour anchors) ---
+        if select_periscope_datetime(target_date=current, tab_url=_PERISCOPE_MARKET_TIDE_URL):
+            _time.sleep(3.0)  # allow data fetch after date navigation
+            tide_key = f"{current.strftime('%Y%m%d')}_market_tide"
+            tide_path = snapshot_dir / f"{tide_key}.png"
+            for attempt in range(1, 4):
+                tide_ws = _cdp_ws_for_tab(_PERISCOPE_MARKET_TIDE_URL)
+                if tide_ws and _cdp_screenshot_tab(tide_ws, tide_path):
+                    logger.info("Historical market-tide screenshot: %s", tide_path.name)
+                    results[tide_key] = tide_path
+                    break
+                if attempt < 3:
+                    logger.warning("Market-tide screenshot attempt %d/3 failed for %s — retrying in 5 s.",
+                                   attempt, current)
+                    _time.sleep(5)
+            else:
+                logger.warning("capture_periscope_historical: market-tide screenshot failed for %s.", current)
+        else:
+            logger.warning("capture_periscope_historical: could not navigate market-tide to %s.", current)
 
         current += timedelta(days=1)
 
