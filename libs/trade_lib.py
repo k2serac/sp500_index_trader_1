@@ -27,14 +27,13 @@ _FALLBACK_TABS = [
     "https://unusualwhales.com/flow/overview",
     "https://unusualwhales.com/periscope/market-exposure",
     "https://unusualwhales.com/periscope/delta-flow",
-    "https://unusualwhales.com/periscope/market-tide",
 ]
 
 # These three tabs are always reloaded and screenshotted in live mode regardless of bookmarks.
 _REQUIRED_PERISCOPE_TABS = [
     "https://unusualwhales.com/periscope/market-exposure",
     "https://unusualwhales.com/periscope/delta-flow",
-    "https://unusualwhales.com/periscope/market-tide",
+    "https://unusualwhales.com/flow/overview",
 ]
 
 # Populated by open_uw_browser() so capture_periscope_screenshots() knows which URLs to target.
@@ -147,7 +146,7 @@ def _cdp_ws_for_tab(tab_url: str) -> str | None:
 
 
 _PERISCOPE_MARKET_EXPOSURE_URL = "https://unusualwhales.com/periscope/market-exposure"
-_PERISCOPE_MARKET_TIDE_URL    = "https://unusualwhales.com/periscope/market-tide"
+_PERISCOPE_MARKET_TIDE_URL    = "https://unusualwhales.com/flow/overview"
 
 _JS_GET_PERISCOPE_DATE = r"""
 (function() {
