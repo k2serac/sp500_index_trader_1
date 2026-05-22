@@ -285,6 +285,40 @@ def _cdp_click(ws_url: str, selector: str) -> bool:
     return True
 
 
+def _cdp_open_tab(url: str, wait_secs: float = 12.0) -> str | None:
+    """Open a new tab in the existing Chrome instance via Target.createTarget.
+
+    Returns the WebSocket URL of the new tab, or None on failure.
+    wait_secs: how long to wait for the page to load before returning.
+    """
+    import json as _json
+    import time as _time
+    import websocket as _ws
+
+    tabs = _cdp_tabs()
+    if not tabs:
+        logger.warning("_cdp_open_tab: CDP not reachable, cannot open %s", url)
+        return None
+
+    any_ws = next(iter(tabs.values())).replace("localhost", "127.0.0.1")
+    try:
+        ws = _ws.create_connection(any_ws, timeout=10)
+        try:
+            ws.send(_json.dumps({"id": 1, "method": "Target.createTarget", "params": {"url": url}}))
+            while True:
+                msg = _json.loads(ws.recv())
+                if msg.get("id") == 1:
+                    break
+        finally:
+            ws.close()
+    except Exception as exc:
+        logger.warning("_cdp_open_tab: could not open %s: %s", url, exc)
+        return None
+
+    _time.sleep(wait_secs)
+    return _cdp_ws_for_tab(url)
+
+
 def _cdp_reload(ws_url: str, wait_secs: float = 10.0) -> None:
     """Reload a CDP tab and wait for Page.loadEventFired (or timeout)."""
     import json as _json
@@ -547,6 +581,9 @@ def capture_periscope_historical(
                                current, hour)
 
         # --- Market Tide: one screenshot per day (date-only, no hour anchors) ---
+        if not _cdp_ws_for_tab(_PERISCOPE_MARKET_TIDE_URL):
+            logger.info("Market-tide tab not open — opening via CDP...")
+            _cdp_open_tab(_PERISCOPE_MARKET_TIDE_URL)
         if select_periscope_datetime(target_date=current, tab_url=_PERISCOPE_MARKET_TIDE_URL):
             _time.sleep(3.0)  # allow data fetch after date navigation
             tide_key = f"{current.strftime('%Y%m%d')}_market_tide"
