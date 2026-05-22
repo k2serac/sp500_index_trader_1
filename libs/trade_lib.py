@@ -492,19 +492,27 @@ def capture_periscope_historical(
                    and (current > start_date or h >= start_hour)
                    and (current < end_date or h <= end_hour)]
 
+        import time as _time
         for lnk, hour in anchors:
             _cdp_click_xy(ws_url, lnk["x"], lnk["y"])
-            import time as _time; _time.sleep(8.0)  # wait for React chart re-render
+            _time.sleep(15.0)  # React re-render blocks Chrome's CDP for 10-30 s
 
             key = f"{current.strftime('%Y%m%d')}_{hour:02d}h"
             out_path = snapshot_dir / f"{key}_periscope_market_exposure.png"
 
-            ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
-            if ws_url and _cdp_screenshot_tab(ws_url, out_path):
-                logger.info("Historical screenshot: %s", out_path.name)
-                results[key] = out_path
+            for attempt in range(1, 4):
+                ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
+                if ws_url and _cdp_screenshot_tab(ws_url, out_path):
+                    logger.info("Historical screenshot: %s", out_path.name)
+                    results[key] = out_path
+                    break
+                if attempt < 3:
+                    logger.warning("Screenshot attempt %d/3 failed for %s %02dh — retrying in 5 s.",
+                                   attempt, current, hour)
+                    _time.sleep(5)
             else:
-                logger.warning("capture_periscope_historical: screenshot failed for %s %02dh.", current, hour)
+                logger.warning("capture_periscope_historical: screenshot failed for %s %02dh after 3 attempts.",
+                               current, hour)
 
         current += timedelta(days=1)
 
