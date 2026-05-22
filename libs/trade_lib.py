@@ -222,12 +222,19 @@ def _hour_minute_to_chart_x(hour: int, minute: int, hour_links: list[dict]) -> f
 
 
 def _cdp_click_xy(ws_url: str, x: float, y: float) -> None:
-    """Click at page coordinates via CDP Input.dispatchMouseEvent."""
+    """Click at page coordinates via CDP Input.dispatchMouseEvent (fire-and-forget).
+
+    We do NOT wait for Chrome to ACK the dispatches: clicking a chart anchor
+    triggers a heavy synchronous React re-render that blocks Chrome's main thread
+    (and therefore the CDP response loop) for 30+ seconds. The TCP layer guarantees
+    our messages are delivered to Chrome before any close frame, so the events
+    are queued and executed even though we close the socket immediately.
+    """
     import json as _json
     import websocket as _ws
 
     ws_url = ws_url.replace("localhost", "127.0.0.1")
-    ws = _ws.create_connection(ws_url, timeout=30)
+    ws = _ws.create_connection(ws_url, timeout=10)
     try:
         for mid, etype in [(1, "mousePressed"), (2, "mouseReleased")]:
             ws.send(_json.dumps({
@@ -235,10 +242,6 @@ def _cdp_click_xy(ws_url: str, x: float, y: float) -> None:
                 "method": "Input.dispatchMouseEvent",
                 "params": {"type": etype, "x": x, "y": y, "button": "left", "clickCount": 1},
             }))
-            while True:
-                msg = _json.loads(ws.recv())
-                if msg.get("id") == mid:
-                    break
     finally:
         ws.close()
 
