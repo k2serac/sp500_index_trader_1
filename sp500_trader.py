@@ -16,7 +16,7 @@ import argparse
 import logging
 import time
 import tomllib
-from datetime import datetime, time as dt_time
+from datetime import date, datetime, time as dt_time
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +26,7 @@ from trading_common.trade_lib import TradeHour
 from libs import (
     MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
     TradeManager, TradingJournal, open_uw_browser, capture_periscope_screenshots,
+    select_periscope_datetime,
     PeriscopeReader,
     is_rth, minutes_since_open, in_trading_window, in_periscope_window,
 )
@@ -102,6 +103,9 @@ def main() -> None:
                 " [DRY RUN]" if args.dry_run else "")
 
     open_uw_browser()
+    # Give Chrome time to load before we try to interact with it via CDP.
+    time.sleep(15)
+    select_periscope_datetime(target_date=date.today())
 
     # Connect to IBKR
     ib = IB()
