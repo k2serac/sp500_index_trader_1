@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -62,12 +61,19 @@ class TradingJournal:
             sessions[-1]["stop"] = datetime.now(MARKET_TZ).isoformat()
         self._save()
 
-    def log_signal(self, signal) -> None:
+    def log_signal(self, signal, periscope_data=None) -> None:
+        snap = signal.snapshot
+        bid, ask = snap.spy_bid, snap.spy_ask
         self._data["signals_detected"].append({
             "timestamp": signal.timestamp.isoformat(),
-            "spy_price": signal.snapshot.spy_price,
-            "tick": signal.snapshot.tick,
-            "vix": signal.snapshot.vix,
+            "spy_price": snap.spy_price,
+            "spy_bid": snap.spy_bid,
+            "spy_ask": snap.spy_ask,
+            "spy_spread": round(ask - bid, 4) if bid is not None and ask is not None else None,
+            "spy_opening_gap_pct": snap.spy_opening_gap_pct,
+            "es_price": snap.es_price,
+            "tick": snap.tick,
+            "vix": snap.vix,
             "conditions_met": signal.conditions_met,
             "tick_flush": signal.tick_flush,
             "tick_snap": signal.tick_snap,
@@ -75,19 +81,38 @@ class TradingJournal:
             "volume_exhaustion": signal.volume_exhaustion,
             "candle_structure": signal.candle_structure,
             "support_level": signal.support_level,
+            "periscope_summary": periscope_data.summary() if periscope_data is not None else None,
         })
         self._save()
 
     def log_claude_verdict(self, signal, verdict) -> None:
         self._data["claude_verdicts"].append({
             "timestamp": signal.timestamp.isoformat(),
+            "spy_price": signal.snapshot.spy_price,
+            "spy_opening_gap_pct": signal.snapshot.spy_opening_gap_pct,
+            "es_price": signal.snapshot.es_price,
+            "conditions_met": signal.conditions_met,
             "go": verdict.go,
             "confidence": verdict.confidence,
             "support_level": verdict.support_level,
             "stop_level": verdict.stop_level,
             "target_level": verdict.target_level,
             "reasoning": verdict.reasoning,
+            "raw_response": verdict.raw_response,
+            "spy_price_at_eod": None,   # filled in by log_eod_snapshot
         })
+        self._save()
+
+    def log_eod_snapshot(self, spy_price: float | None, es_price: float | None = None) -> None:
+        """Record closing prices and back-fill them into all open verdicts for the day."""
+        self._data["eod_snapshot"] = {
+            "timestamp": datetime.now(MARKET_TZ).isoformat(),
+            "spy_price": spy_price,
+            "es_price": es_price,
+        }
+        for verdict in self._data["claude_verdicts"]:
+            if verdict.get("spy_price_at_eod") is None:
+                verdict["spy_price_at_eod"] = spy_price
         self._save()
 
     def log_entry(self, trade: dict, signal, verdict) -> None:

@@ -28,6 +28,30 @@
 - Periscope shows data in 10-minute buckets — confirm the screenshot timestamp aligns
   with the signal time before drawing conclusions.
 
+[OPENING_GAP]
+- The signal summary includes `gap=X.XX%` — the difference between today's RTH open and
+  the prior session close.
+- Large negative gap (gap < -0.5%): primary target setup. A macro-driven selloff from an
+  already-depressed open is the highest-probability mean-reversion scenario. Weight signal
+  confluence heavily and proceed if conditions are met.
+- Small gap (-0.5% to +0.5%): quiet support bounce setup. Valid, but price has less
+  downside momentum to reverse — require cleaner GEX floor confirmation (clear large green
+  bar at or below current price) and preference for 4+ conditions before going positive.
+- Large positive gap (gap > +0.5%): price opened near the session high. This strategy does
+  not target long entries from the high of the day. Return GO: false unless there has been
+  a significant intraday selloff that has reset price back to a GEX support level — in
+  that case treat it as a quiet bounce setup and apply the higher confirmation bar above.
+
+[ES_FUTURES]
+- The signal summary includes `ES=XXXX.XX` — the front-month E-mini S&P 500 futures price
+  (denominated in SPX points, roughly 10× SPY price).
+- If ES is already recovering and leading SPY higher while SPY sits at a support level,
+  that is a bullish divergence — additional confirmation the floor is holding.
+- If ES is still making new lows at the time of the signal, the support level in SPY may
+  not hold — weight this against the entry and reduce confidence accordingly.
+- Pre-market: a large ES discount to prior SPY close confirms the gap-down setup before
+  RTH opens.
+
 [RISK]
 - Never recommend a stop more than 0.5% below entry — the strategy targets tight
   risk with asymmetric reward.

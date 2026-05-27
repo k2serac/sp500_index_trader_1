@@ -20,6 +20,7 @@ data = reader.read(shots)
 if data:
     print("\nExtracted PeriscopeData:")
     print(data.summary())
-    print(f"\nAll GEX levels for SignalEvaluator: {data.all_gex_levels()}")
+    print(f"\nAll GEX levels     : {data.all_gex_levels()}")
+    print(f"All key levels     : {data.all_key_levels()}")
 else:
     print("\nFailed to extract data.")

@@ -20,7 +20,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import anthropic
-from ib_async import IB, Index, Stock, util
+from ib_async import IB, ContFuture, Index, Stock, util
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,11 @@ class MarketSnapshot:
     tick: float | None      # current NYSE TICK
     vix: float | None       # current VIX
     vix_bars: list[float]   # last N VIX closes
+    es_price: float | None = None   # ES front-month futures price (SPX points)
+    es_bars: list[Bar] = field(default_factory=list)
+    spy_bid: float | None = None
+    spy_ask: float | None = None
+    spy_opening_gap_pct: float | None = None  # (today_open - prior_close) / prior_close * 100
 
 
 @dataclass
@@ -74,8 +79,13 @@ class ReversalSignal:
 
     def summary(self) -> str:
         spy = self.snapshot.spy_price
+        es_str = f"  ES={self.snapshot.es_price:.2f}" if self.snapshot.es_price else ""
+        bid, ask = self.snapshot.spy_bid, self.snapshot.spy_ask
+        spread_str = f"  spread={ask - bid:.2f}" if bid is not None and ask is not None else ""
+        gap = self.snapshot.spy_opening_gap_pct
+        gap_str = f"  gap={gap:+.2f}%" if gap is not None else ""
         return (
-            f"SPY={spy:.2f}  TICK={self.snapshot.tick}  VIX={self.snapshot.vix:.2f}\n"
+            f"SPY={spy:.2f}{es_str}{spread_str}{gap_str}  TICK={self.snapshot.tick}  VIX={self.snapshot.vix:.2f}\n"
             f"Conditions met: {self.conditions_met}/5\n"
             f"  TICK flush+snap : {'✓' if self.tick_flush and self.tick_snap else '✗'}\n"
             f"  VIX divergence  : {'✓' if self.vix_divergence else '✗'}\n"
@@ -107,6 +117,7 @@ class MarketDataFeed:
     _SPY_CONTRACT   = Stock("SPY", "SMART", "USD")
     _TICK_CONTRACT  = Index("$TICK", "NYSE")
     _VIX_CONTRACT   = Index("VIX", "CBOE")
+    _ES_CONTRACT    = ContFuture("ES", "GLOBEX", "USD")
 
     def __init__(self, ib: IB, candle_timeframe: int = 5, bar_lookback: int = 6) -> None:
         self._ib = ib
@@ -115,13 +126,19 @@ class MarketDataFeed:
 
     def snapshot(self) -> MarketSnapshot:
         now = datetime.now(MARKET_TZ)
+        spy_price, spy_bid, spy_ask = self._get_price_bid_ask(self._SPY_CONTRACT, "SPY")
         return MarketSnapshot(
             timestamp=now,
-            spy_price=self._get_price(self._SPY_CONTRACT, "SPY"),
+            spy_price=spy_price,
+            spy_bid=spy_bid,
+            spy_ask=spy_ask,
+            spy_opening_gap_pct=self._get_opening_gap_pct(),
             spy_bars=self._get_bars(self._SPY_CONTRACT, "SPY"),
             tick=self._get_price(self._TICK_CONTRACT, "$TICK"),
             vix=self._get_price(self._VIX_CONTRACT, "VIX"),
             vix_bars=self._get_vix_bar_closes(),
+            es_price=self._get_price(self._ES_CONTRACT, "ES"),
+            es_bars=self._get_bars(self._ES_CONTRACT, "ES"),
         )
 
     def _get_price(self, contract, label: str) -> float | None:
@@ -135,6 +152,51 @@ class MarketDataFeed:
             return float(price)
         except Exception as exc:
             logger.error("Error fetching %s price: %s", label, exc)
+            return None
+
+    def _get_price_bid_ask(
+        self, contract, label: str
+    ) -> tuple[float | None, float | None, float | None]:
+        """Fetch price, bid, and ask in a single reqTickers call."""
+        try:
+            self._ib.qualifyContracts(contract)
+            [ticker] = self._ib.reqTickers(contract)
+
+            def _clean(val) -> float | None:
+                return float(val) if val is not None and not math.isnan(val) and val > 0 else None
+
+            price = _clean(ticker.marketPrice())
+            if price is None:
+                logger.warning("No price for %s.", label)
+            return price, _clean(ticker.bid), _clean(ticker.ask)
+        except Exception as exc:
+            logger.error("Error fetching %s price/spread: %s", label, exc)
+            return None, None, None
+
+    def _get_opening_gap_pct(self) -> float | None:
+        """(today's RTH open - prior RTH close) / prior close * 100."""
+        try:
+            self._ib.qualifyContracts(self._SPY_CONTRACT)
+            bars = self._ib.reqHistoricalData(
+                self._SPY_CONTRACT,
+                endDateTime="",
+                durationStr="2 D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+            if len(bars) < 2:
+                return None
+            prior_close = bars[-2].close
+            today_open = bars[-1].open
+            if not prior_close or math.isnan(prior_close) or prior_close == 0:
+                return None
+            if not today_open or math.isnan(today_open):
+                return None
+            return round((today_open - prior_close) / prior_close * 100, 2)
+        except Exception as exc:
+            logger.error("Error fetching opening gap: %s", exc)
             return None
 
     def _get_bars(self, contract, label: str) -> list[Bar]:
@@ -198,6 +260,12 @@ class SignalEvaluator:
     def update_support_levels(self, levels: list[float]) -> None:
         self._support_levels = levels
         logger.info("Support levels updated: %s", levels)
+
+    def feed_tick_history(self, values: list[float]) -> None:
+        """Append a batch of TICK readings (e.g. 1-min bars) into the rolling history."""
+        self._tick_history.extend(values)
+        if len(self._tick_history) > 20:
+            self._tick_history = self._tick_history[-20:]
 
     def evaluate(self, snap: MarketSnapshot) -> ReversalSignal | None:
         if snap.spy_price is None or snap.tick is None or snap.vix is None:

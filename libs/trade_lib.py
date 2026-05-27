@@ -151,7 +151,6 @@ _PERISCOPE_MARKET_TIDE_URL    = "https://unusualwhales.com/flow/overview"
 _JS_GET_PERISCOPE_DATE = r"""
 (function() {
     const SELECTORS = [
-        '[data-testid="market-exposures-tick-chart"] span[role="button"]',
         '[data-testid="date-picker-button"]',
         'button[aria-label="date-picker"]',
     ];
@@ -183,6 +182,16 @@ _JS_GET_CHART_HOUR_LINKS = r"""
 """
 
 _JS_GET_ELEM_CENTRE = "(function(s){const e=document.querySelector(s);if(!e)return null;const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2}})(%s)"
+
+_JS_CLICK_SELECTOR = r"""
+(function(selector) {
+    const el = document.querySelector(selector);
+    if (!el) return 'not_found';
+    el.scrollIntoView({block: 'nearest'});
+    el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+    return 'clicked';
+})(%s)
+"""
 
 
 def _parse_periscope_date(text: str) -> date | None:
@@ -416,13 +425,26 @@ def select_periscope_datetime(
             if current is None:
                 logger.warning("select_periscope_datetime: unparseable date string %r", raw)
                 return False
+            logger.debug("select_periscope_datetime: page shows %r → %s (target %s)", raw, current, target_date)
             delta = (target_date - current).days
             if delta == 0:
                 break
             selector = ('button[aria-label="Next day"]' if delta > 0
                         else 'button[aria-label="Previous day"]')
-            _cdp_click(ws_url, selector)
-            _time.sleep(1.2)
+            import json as _json2
+            result = _cdp_evaluate(ws_url, _JS_CLICK_SELECTOR % _json2.dumps(selector))
+            if result == "not_found":
+                logger.warning("select_periscope_datetime: %r button not found in DOM", selector)
+                return False
+            logger.debug("select_periscope_datetime: dispatched click on %r", selector)
+            # Poll until the date picker DOM actually changes (up to 15 s).
+            # Market-exposure renders slowly; a fixed sleep caused repeated clicks
+            # that over-shot the target before the DOM updated.
+            for _ in range(15):
+                _time.sleep(1.0)
+                new_raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_DATE)
+                if new_raw and new_raw != raw:
+                    break
         else:
             logger.warning("select_periscope_datetime: could not reach %s after 30 clicks", target_date)
             return False
@@ -437,16 +459,19 @@ def select_periscope_datetime(
 
         # Build (link, parsed_hour) pairs
         anchors = [(lnk, h) for lnk in links if (h := _chart_label_to_hour(lnk["text"])) is not None]
+        if not anchors:
+            logger.warning("select_periscope_datetime: no parseable hour anchors on chart")
+            return False
 
-        # Prefer exact match, else nearest anchor ≤ target_hour
-        match = next((lnk for lnk, h in anchors if h == target_hour), None)
-        if match is None:
-            candidates = [(lnk, h) for lnk, h in anchors if h <= target_hour]
-            if not candidates:
-                logger.warning("select_periscope_datetime: no anchor ≤ %02d:00; available: %s",
-                               target_hour, [h for _, h in anchors])
-                return False
+        # Prefer nearest anchor ≤ target_hour; if target_hour is before all anchors, use earliest
+        candidates = [(lnk, h) for lnk, h in anchors if h <= target_hour]
+        if candidates:
             match, snapped = max(candidates, key=lambda t: t[1])
+        else:
+            match, snapped = min(anchors, key=lambda t: t[1])
+            logger.info("select_periscope_datetime: %02d:00 before all anchors — using earliest %02d:00",
+                        target_hour, snapped)
+        if snapped != target_hour:
             logger.info("select_periscope_datetime: snapped %02d:00 → %02d:00", target_hour, snapped)
 
         _cdp_click_xy(ws_url, match["x"], match["y"])
@@ -496,7 +521,9 @@ def capture_periscope_screenshots(snapshot_dir: Path | str) -> dict[str, Path]:
         out_path = snapshot_dir / f"{timestamp}_{slug}.png"
 
         # Reload so the page advances to the latest 10-minute bucket.
+        # Sleep after loadEventFired — React needs extra time to render chart content.
         _cdp_reload(ws_url)
+        _time.sleep(8.0)
 
         for attempt in range(1, 4):
             if _cdp_screenshot_tab(ws_url, out_path):
@@ -605,6 +632,70 @@ def capture_periscope_historical(
         current += timedelta(days=1)
 
     return results
+
+
+def capture_periscope_for_backtest(
+    snapshot_dir: Path | str,
+    target_date: date,
+    target_hour: int,
+) -> dict[str, Path]:
+    """Navigate Periscope to target_date/hour and capture screenshots without reloading.
+
+    Captures market-exposure (at target_hour) and market-tide (date only).
+    Safe for historical dates — does not reload tabs (which would reset to today).
+
+    Returns {"periscope_market_exposure": path, "flow_overview": path}
+    for each tab successfully captured.
+    """
+    import time as _time
+
+    snapshot_dir = Path(snapshot_dir)
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    date_str = target_date.strftime("%Y%m%d")
+    results: dict[str, Path] = {}
+
+    # --- Market Exposure at target_hour ---
+    if select_periscope_datetime(target_date=target_date, target_hour=target_hour):
+        ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
+        if ws_url:
+            out_path = snapshot_dir / f"{date_str}_{target_hour:02d}h_periscope_market_exposure.png"
+            for attempt in range(1, 4):
+                ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
+                if ws_url and _cdp_screenshot_tab(ws_url, out_path):
+                    results["periscope_market_exposure"] = out_path
+                    logger.info("Backtest screenshot: %s", out_path.name)
+                    break
+                if attempt < 3:
+                    _time.sleep(5)
+            else:
+                logger.warning("capture_periscope_for_backtest: market-exposure failed for %s %02dh", target_date, target_hour)
+    else:
+        logger.warning("capture_periscope_for_backtest: could not navigate market-exposure to %s %02dh", target_date, target_hour)
+
+    # --- Market Tide (date only, no hour anchor) ---
+    if not _cdp_ws_for_tab(_PERISCOPE_MARKET_TIDE_URL):
+        logger.info("Market-tide tab not open — opening via CDP...")
+        _cdp_open_tab(_PERISCOPE_MARKET_TIDE_URL)
+        _time.sleep(5.0)
+
+    if select_periscope_datetime(target_date=target_date, tab_url=_PERISCOPE_MARKET_TIDE_URL):
+        _time.sleep(3.0)
+        out_path = snapshot_dir / f"{date_str}_market_tide.png"
+        for attempt in range(1, 4):
+            tide_ws = _cdp_ws_for_tab(_PERISCOPE_MARKET_TIDE_URL)
+            if tide_ws and _cdp_screenshot_tab(tide_ws, out_path):
+                results["flow_overview"] = out_path
+                logger.info("Backtest market-tide screenshot: %s", out_path.name)
+                break
+            if attempt < 3:
+                _time.sleep(5)
+        else:
+            logger.warning("capture_periscope_for_backtest: market-tide failed for %s", target_date)
+    else:
+        logger.warning("capture_periscope_for_backtest: could not navigate market-tide to %s", target_date)
+
+    return results
+
 
 from .signal_lib import ClaudeVerdict, ReversalSignal
 

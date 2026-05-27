@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pandas as pd
 from ib_async import IB
-from trading_common.trade_lib import TradeHour
+from trading_common.trade_lib import TradeHour, ensure_ibkr_connected
 
 from libs import (
     MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
@@ -88,6 +88,16 @@ MIN_CONDITIONS_FOR_CLAUDE = 3
 # Main
 # ---------------------------------------------------------------------------
 
+def _sleep(secs: float) -> None:
+    """Sleep in 1-second chunks so Ctrl+C is detected promptly."""
+    end = time.monotonic() + secs
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1.0, remaining))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="S&P 500 Index Trader")
     parser.add_argument("--mode", choices=["demo", "live"], default="demo")
@@ -104,7 +114,7 @@ def main() -> None:
 
     open_uw_browser()
     # Give Chrome time to load before we try to interact with it via CDP.
-    time.sleep(15)
+    _sleep(15)
     select_periscope_date_all(target_date=date.today())
 
     # Connect to IBKR
@@ -142,125 +152,133 @@ def main() -> None:
 
     try:
         while True:
-            loop_count += 1
-            now = datetime.now(MARKET_TZ)
+            try:
+                loop_count += 1
+                now = datetime.now(MARKET_TZ)
 
-            # --- Idle sleep: only active 9:21–16:00 ET on trading days ---
-            if not in_periscope_window(now) or not trade_hour.is_trading_day():
-                # Search for next trading day from today if before 9:21, else from tomorrow
-                # (handles the after-16:00 case where today's 9:20 is already in the past).
-                search_from = 0 if now.time() < dt_time(9, 21) else 1
-                wake_at = None
-                for offset in range(search_from, search_from + 8):
-                    candidate = now + pd.Timedelta(days=offset)
-                    if trade_hour.is_trading_day(candidate):
-                        wake_at = candidate.replace(hour=9, minute=20, second=0, microsecond=0)
-                        break
+                # --- Idle sleep: only active 9:21–16:00 ET on trading days ---
+                if not in_periscope_window(now) or not trade_hour.is_trading_day():
+                    # Search for next trading day from today if before 9:21, else from tomorrow
+                    # (handles the after-16:00 case where today's 9:20 is already in the past).
+                    search_from = 0 if now.time() < dt_time(9, 21) else 1
+                    wake_at = None
+                    for offset in range(search_from, search_from + 8):
+                        candidate = now + pd.Timedelta(days=offset)
+                        if trade_hour.is_trading_day(candidate):
+                            wake_at = candidate.replace(hour=9, minute=20, second=0, microsecond=0)
+                            break
 
-                if wake_at is None:
-                    wake_at = now + pd.Timedelta(days=7)  # safety fallback
+                    if wake_at is None:
+                        wake_at = now + pd.Timedelta(days=7)  # safety fallback
 
-                secs = (wake_at - now).total_seconds()
-                if secs > LOOP_INTERVAL_SECS:
-                    logger.info("Market inactive — sleeping until %s (%.1f hr).",
-                                wake_at.strftime("%Y-%m-%d %H:%M ET"), secs / 3600)
-                    time.sleep(secs)
+                    secs = (wake_at - now).total_seconds()
+                    if secs > LOOP_INTERVAL_SECS:
+                        logger.info("Market inactive — sleeping until %s (%.1f hr).",
+                                    wake_at.strftime("%Y-%m-%d %H:%M ET"), secs / 3600)
+                        _sleep(secs)
+                        continue
+
+                # --- Periscope screenshots at :01, :11, :21 ... from 9:21 until market close ---
+                # Periscope updates on the 10-min mark; we wait 1 min for data to settle.
+                current_window = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
+                if in_periscope_window(now) and now.minute % 10 == 1 and current_window != last_screenshot_window:
+                    shots = capture_periscope_screenshots(PERISCOPE_DIR)
+                    last_screenshot_window = current_window
+                    if shots:
+                        periscope_data = periscope_reader.read(shots)
+                        if periscope_data is not None:
+                            latest_periscope_data = periscope_data
+                            latest_periscope_shots = shots
+                            logger.info("Periscope update:\n%s", periscope_data.summary())
+                            evaluator.update_support_levels(periscope_data.all_key_levels_spy())
+                logger.info("Loop #%d — %s", loop_count, now.strftime("%H:%M:%S ET"))
+
+                ensure_ibkr_connected(ib, IBKR_HOST, port, IBKR_CLIENT_ID)
+
+                # --- Fetch market snapshot ---
+                snap = feed.snapshot()
+
+                # --- Monitor open position stops/targets ---
+                if trader.has_position and snap.spy_price is not None:
+                    trader.check_stops_and_targets(snap.spy_price)
+
+                # --- Pre-close sweep: close all positions 5 min before RTH close ---
+                if now.time() >= dt_time(15, 55):
+                    if snap.spy_price is not None:
+                        journal.log_eod_snapshot(snap.spy_price, es_price=snap.es_price)
+                    if trader.has_position:
+                        logger.info("Pre-close sweep — closing all positions.")
+                        trader.close_all(reason="pre-close sweep")
+
+                # --- Only look for new entries within the trading window ---
+                if not in_trading_window(now, TRADING_START_MIN, TRADING_END_MIN):
+                    logger.debug("Outside trading window — skipping signal evaluation.")
+                    _sleep(LOOP_INTERVAL_SECS)
                     continue
 
-            # --- Periscope screenshots at :01, :11, :21 ... from 9:21 until market close ---
-            # Periscope updates on the 10-min mark; we wait 1 min for data to settle.
-            current_window = now.replace(minute=(now.minute // 10) * 10, second=0, microsecond=0)
-            if in_periscope_window(now) and now.minute % 10 == 1 and current_window != last_screenshot_window:
-                shots = capture_periscope_screenshots(PERISCOPE_DIR)
-                last_screenshot_window = current_window
-                if shots:
-                    periscope_data = periscope_reader.read(shots)
-                    if periscope_data is not None:
-                        latest_periscope_data = periscope_data
-                        latest_periscope_shots = shots
-                        logger.info("Periscope update:\n%s", periscope_data.summary())
-                        evaluator.update_support_levels(periscope_data.all_key_levels())
-            logger.info("Loop #%d — %s", loop_count, now.strftime("%H:%M:%S ET"))
+                if trader.has_position:
+                    _sleep(LOOP_INTERVAL_SECS)
+                    continue
 
-            if not ib.isConnected():
-                logger.warning("IBKR disconnected — reconnecting...")
-                ib.connect(IBKR_HOST, port, clientId=IBKR_CLIENT_ID)
+                # --- Evaluate reversal signal ---
+                signal = evaluator.evaluate(snap)
+                if signal is None:
+                    _sleep(LOOP_INTERVAL_SECS)
+                    continue
 
-            # --- Fetch market snapshot ---
-            snap = feed.snapshot()
+                logger.debug("Signal: %d/5 conditions\n%s", signal.conditions_met, signal.summary())
 
-            # --- Monitor open position stops/targets ---
-            if trader.has_position and snap.spy_price is not None:
-                trader.check_stops_and_targets(snap.spy_price)
+                if signal.conditions_met < MIN_CONDITIONS_FOR_CLAUDE:
+                    _sleep(LOOP_INTERVAL_SECS)
+                    continue
 
-            # --- Pre-close sweep: close all positions 5 min before RTH close ---
-            if now.time() >= dt_time(15, 55) and trader.has_position:
-                logger.info("Pre-close sweep — closing all positions.")
-                trader.close_all(reason="pre-close sweep")
+                logger.info("Potential reversal — %d/5 conditions met. Logging signal.", signal.conditions_met)
+                journal.log_signal(signal, periscope_data=latest_periscope_data)
 
-            # --- Only look for new entries within the trading window ---
-            if not in_trading_window(now, TRADING_START_MIN, TRADING_END_MIN):
-                logger.debug("Outside trading window — skipping signal evaluation.")
-                time.sleep(LOOP_INTERVAL_SECS)
-                continue
+                # --- Call Claude for go/no-go ---
+                if analyst is not None:
+                    logger.info("Calling Claude for verdict...")
+                    exposure_path = latest_periscope_shots.get("periscope_market_exposure")
+                    verdict = analyst.analyze(
+                        signal,
+                        periscope_data=latest_periscope_data,
+                        periscope_screenshot_path=str(exposure_path) if exposure_path else None,
+                    )
+                    journal.log_claude_verdict(signal, verdict)
+                    logger.info(
+                        "Claude verdict: GO=%s  confidence=%d/10  %s",
+                        verdict.go, verdict.confidence, verdict.reasoning,
+                    )
 
-            if trader.has_position:
-                time.sleep(LOOP_INTERVAL_SECS)
-                continue
-
-            # --- Evaluate reversal signal ---
-            signal = evaluator.evaluate(snap)
-            if signal is None:
-                time.sleep(LOOP_INTERVAL_SECS)
-                continue
-
-            logger.debug("Signal: %d/5 conditions\n%s", signal.conditions_met, signal.summary())
-
-            if signal.conditions_met < MIN_CONDITIONS_FOR_CLAUDE:
-                time.sleep(LOOP_INTERVAL_SECS)
-                continue
-
-            logger.info("Potential reversal — %d/5 conditions met. Logging signal.", signal.conditions_met)
-            journal.log_signal(signal)
-
-            # --- Call Claude for go/no-go ---
-            if analyst is not None:
-                logger.info("Calling Claude for verdict...")
-                exposure_path = latest_periscope_shots.get("periscope_market_exposure")
-                verdict = analyst.analyze(
-                    signal,
-                    periscope_data=latest_periscope_data,
-                    periscope_screenshot_path=str(exposure_path) if exposure_path else None,
-                )
-                journal.log_claude_verdict(signal, verdict)
-                logger.info(
-                    "Claude verdict: GO=%s  confidence=%d/10  %s",
-                    verdict.go, verdict.confidence, verdict.reasoning,
-                )
-
-                if verdict.go and verdict.confidence >= 6:
-                    if args.dry_run:
-                        logger.info("[DRY RUN] Would place entry order.")
+                    if verdict.go and verdict.confidence >= 6:
+                        if args.dry_run:
+                            logger.info("[DRY RUN] Would place entry order.")
+                        else:
+                            trader.enter(signal, verdict)
                     else:
-                        trader.enter(signal, verdict)
+                        logger.info("Claude said no — standing down.")
                 else:
-                    logger.info("Claude said no — standing down.")
-            else:
-                # No Claude — apply a stricter threshold
-                if signal.conditions_met >= 5:
-                    logger.info("All 5 conditions met — placing trade without Claude.")
-                    if not args.dry_run:
-                        from libs.signal_lib import ClaudeVerdict
-                        auto_verdict = ClaudeVerdict(
-                            go=True, confidence=7,
-                            support_level=signal.support_level,
-                            stop_level=None, target_level=None,
-                            reasoning="All 5 conditions met — auto entry.",
-                            raw_response="",
-                        )
-                        trader.enter(signal, auto_verdict)
+                    # No Claude — apply a stricter threshold
+                    if signal.conditions_met >= 5:
+                        logger.info("All 5 conditions met — placing trade without Claude.")
+                        if not args.dry_run:
+                            from libs.signal_lib import ClaudeVerdict
+                            auto_verdict = ClaudeVerdict(
+                                go=True, confidence=7,
+                                support_level=signal.support_level,
+                                stop_level=None, target_level=None,
+                                reasoning="All 5 conditions met — auto entry.",
+                                raw_response="",
+                            )
+                            trader.enter(signal, auto_verdict)
 
-            time.sleep(LOOP_INTERVAL_SECS)
+                _sleep(LOOP_INTERVAL_SECS)
+
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                logger.error("Unhandled error in main loop — will retry: %s", exc, exc_info=True)
+                _sleep(LOOP_INTERVAL_SECS)
 
     except KeyboardInterrupt:
         logger.info("Interrupted — shutting down.")
