@@ -16,8 +16,9 @@ Usage:
     python backtest.py --mode demo
     python backtest.py --mode demo --start-date 2026-05-20 --end-date 2026-05-23
     python backtest.py --mode demo --start-date 2026-05-22 --start-hour 10 --end-hour 13
-    python backtest.py --mode demo --no-browser   # use pre-saved history_YYYYMMDD/ dirs
-    python backtest.py --mode demo --verbose
+    python backtest.py --mode demo --no-browser          # use pre-saved history_YYYYMMDD/ dirs
+    python backtest.py --mode demo --log-level DEBUG     # full bar-by-bar trace
+    python backtest.py --mode demo --verbose             # alias for --log-level DEBUG
 """
 
 from __future__ import annotations
@@ -478,11 +479,15 @@ def main() -> None:
                         help=f"Hour ET to stop entries / force exit (default {DEFAULT_END_HOUR})")
     parser.add_argument("--no-browser", action="store_true",
                         help="Skip browser capture; read from pre-saved history_YYYYMMDD/ dirs")
-    parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--log-level", default="INFO",
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+                        help="Logging verbosity (default INFO)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Shorthand for --log-level DEBUG")
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+    level = logging.DEBUG if args.verbose else getattr(logging, args.log_level)
+    logging.getLogger().setLevel(level)
 
     port = IBKR_PORT_DEMO if args.mode == "demo" else IBKR_PORT_LIVE
 
@@ -572,6 +577,17 @@ def main() -> None:
                         continue
 
             pdata = reader.read(shots)
+            if pdata is None and not args.no_browser:
+                # 9am slot may be sparse; retry at 10am before giving up.
+                fallback_hour = 10
+                if fallback_hour != ph:
+                    logger.info(
+                        "  PeriscopeReader returned None at %02d:00 — retrying at %02d:00",
+                        ph, fallback_hour,
+                    )
+                    retry_shots = capture_periscope_for_backtest(history_dir, target_date, fallback_hour)
+                    if retry_shots.get("periscope_market_exposure"):
+                        pdata = reader.read(retry_shots)
             if pdata is None:
                 logger.warning("PeriscopeReader returned None for %s — skipping.", date_fmt)
                 skipped.append(date_fmt)

@@ -416,6 +416,8 @@ def select_periscope_datetime(
 
     # --- Date navigation ---
     if target_date is not None:
+        import json as _json2
+        visited: set[date] = set()
         for _ in range(30):  # safety cap: max 30 single-day clicks
             raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_DATE)
             if not raw:
@@ -426,12 +428,21 @@ def select_periscope_datetime(
                 logger.warning("select_periscope_datetime: unparseable date string %r", raw)
                 return False
             logger.debug("select_periscope_datetime: page shows %r → %s (target %s)", raw, current, target_date)
-            delta = (target_date - current).days
-            if delta == 0:
+            if current == target_date:
                 break
+            # Oscillation guard: if we've visited this date before, the target is
+            # a gap in Periscope's calendar (e.g. a market holiday). Abort early
+            # rather than burning all 30 clicks.
+            if current in visited:
+                logger.warning(
+                    "select_periscope_datetime: oscillating at %s — %s not in Periscope history (holiday/gap)",
+                    current, target_date,
+                )
+                return False
+            visited.add(current)
+            delta = (target_date - current).days
             selector = ('button[aria-label="Next day"]' if delta > 0
                         else 'button[aria-label="Previous day"]')
-            import json as _json2
             result = _cdp_evaluate(ws_url, _JS_CLICK_SELECTOR % _json2.dumps(selector))
             if result == "not_found":
                 logger.warning("select_periscope_datetime: %r button not found in DOM", selector)
