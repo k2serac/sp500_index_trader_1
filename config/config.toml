@@ -51,3 +51,7 @@ snapshot_dir = "periscope_snapshots"
 # Oscillation detection is the primary safety guard; this is a hard backstop.
 # Increase if backtesting dates more than ~60 trading days back from today.
 max_nav_clicks = 60
+
+# Retries when PeriscopeReader returns no data or a parse error.
+# Each retry retakes the screenshot before calling Claude again.
+read_retries = 2

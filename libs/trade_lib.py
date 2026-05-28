@@ -97,6 +97,7 @@ def open_uw_browser() -> None:
         subprocess.Popen(
             ["google-chrome", "--new-window", f"--remote-debugging-port={_CDP_PORT}",
              "--remote-allow-origins=*",
+             "--window-size=1920,1080",
              "--user-data-dir=" + str(Path.home() / ".config/chrome-sp500bot"),
              "--no-first-run", "--no-default-browser-check",
              "--hide-crash-restore-bubble"] + tabs
@@ -203,6 +204,95 @@ _JS_CLICK_SELECTOR = r"""
 })(%s)
 """
 
+# Reads the current "H:MM - H:MM" or "H:MM AM - H:MM AM" timeframe display on the GEX bar chart.
+_JS_GET_PERISCOPE_TIMEFRAME = r"""
+(function() {
+    const re = /^\d{1,2}:\d{2}(\s*[AP]M)?\s*[-–]\s*\d{1,2}:\d{2}(\s*[AP]M)?$/;
+    // Prefer leaf text nodes — avoids matching parent containers whose innerText
+    // includes unrelated content that happens to contain a time range.
+    for (const el of document.querySelectorAll('span,p,div,h1,h2,h3,h4,h5,button')) {
+        const nodes = el.childNodes;
+        if (nodes.length === 1 && nodes[0].nodeType === 3) {
+            const t = nodes[0].textContent.trim();
+            if (re.test(t)) return t;
+        }
+    }
+    // Broader fallback: innerText of any element whose visible text is just a timeframe
+    for (const el of document.querySelectorAll('span,p,div')) {
+        const t = (el.innerText || '').trim();
+        if (re.test(t)) return t;
+    }
+    return null;
+})()
+"""
+
+# Clicks the prev (<) or next (>) timeframe nav button using dispatchEvent('click').
+#
+# Prev strategy: the timeframe-prev button is the first unnamed button to the right
+# of button[aria-label="Next day"] (which is a reliable DOM anchor).
+#
+# Next strategy: the timeframe-next button is the first unnamed button to the right
+# of the timeframe text element.
+#
+# Uses dispatchEvent (same as date nav buttons) rather than CDP mouse events —
+# React synthetic event handlers need a 'click' event, not mousedown/mouseup.
+_JS_CLICK_TIMEFRAME_NAV = r"""
+(function(direction) {
+    const re = /\d{1,2}:\d{2}\s*[-–]\s*\d{1,2}:\d{2}/;
+    function fireClick(el) {
+        el.scrollIntoView({block: 'nearest'});
+        el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, view: window}));
+    }
+    if (direction === 'prev') {
+        // Anchor on the "Next day" date button; the timeframe-prev button is the
+        // first unnamed button that is to the right of it on the same row.
+        const anchor = document.querySelector('button[aria-label="Next day"]');
+        if (!anchor) return 'no_anchor';
+        const aR = anchor.getBoundingClientRect();
+        const aMidY = aR.top + aR.height / 2;
+        let best = null, bestDist = Infinity;
+        for (const btn of document.querySelectorAll('button')) {
+            if (btn.getAttribute('aria-label')) continue;
+            const r = btn.getBoundingClientRect();
+            if (r.width === 0) continue;
+            const midX = r.left + r.width / 2;
+            const midY = r.top + r.height / 2;
+            if (Math.abs(midY - aMidY) > 20) continue;
+            const dx = midX - aR.right;
+            if (dx > 0 && dx < bestDist) { bestDist = dx; best = btn; }
+        }
+        if (!best) return 'not_found';
+        fireClick(best);
+        return 'clicked';
+    } else {
+        // Timeframe-next button is the first unnamed button to the right of the
+        // timeframe text element.
+        let tfEl = null;
+        for (const el of document.querySelectorAll('span,div,p')) {
+            const t = (el.innerText || '').trim();
+            if (re.test(t) && t.length < 30) { tfEl = el; break; }
+        }
+        if (!tfEl) return 'no_timeframe_el';
+        const tfR = tfEl.getBoundingClientRect();
+        const tfMidY = tfR.top + tfR.height / 2;
+        let best = null, bestDist = Infinity;
+        for (const btn of document.querySelectorAll('button')) {
+            if (btn.getAttribute('aria-label')) continue;
+            const r = btn.getBoundingClientRect();
+            if (r.width === 0) continue;
+            const midX = r.left + r.width / 2;
+            const midY = r.top + r.height / 2;
+            if (Math.abs(midY - tfMidY) > 20) continue;
+            const dx = midX - tfR.right;
+            if (dx > 0 && dx < bestDist) { bestDist = dx; best = btn; }
+        }
+        if (!best) return 'not_found';
+        fireClick(best);
+        return 'clicked';
+    }
+})(%s)
+"""
+
 
 def _parse_periscope_date(text: str) -> date | None:
     """Parse 'Wed, May 20' → date (assumes current year)."""
@@ -211,6 +301,21 @@ def _parse_periscope_date(text: str) -> date | None:
         return parsed.replace(year=date.today().year).date()
     except ValueError:
         return None
+
+
+def _parse_timeframe_start(text: str) -> tuple[int, int] | None:
+    """Parse '9:00 - 9:10' or '9:00 AM - 9:10 AM' → (9, 0). Returns None on failure."""
+    import re
+    m = re.match(r"(\d{1,2}):(\d{2})(\s*([AP]M))?", text.strip())
+    if not m:
+        return None
+    h, mn = int(m.group(1)), int(m.group(2))
+    ampm = (m.group(4) or "").upper()
+    if ampm == "PM" and h != 12:
+        h += 12
+    elif ampm == "AM" and h == 12:
+        h = 0
+    return h, mn
 
 
 def _hour_to_chart_label(hour: int) -> str:
@@ -508,6 +613,80 @@ def select_periscope_datetime(
     return True
 
 
+def select_periscope_timeframe(
+    ws_url: str,
+    target_hour: int,
+    target_minute: int = 0,
+) -> bool:
+    """Navigate the Periscope GEX bar-chart timeframe selector to target_hour:target_minute.
+
+    The timeframe selector (< HH:MM - HH:MM >) controls which 10-min GEX snapshot is
+    displayed. It is separate from the hour anchor that scrolls the price chart.
+
+    Uses coordinate-based clicking (same as hour anchors) via _cdp_click_xy, then
+    polls for the DOM to update. Aborts if the timeframe stops changing for 2 consecutive
+    clicks (boundary or mis-click).
+
+    Returns True if the target timeframe was reached, False otherwise.
+    """
+    import json as _json3
+    import time as _time
+
+    MAX_TF_CLICKS = 50  # 39 ten-min windows in a full trading day; 50 is a safe cap
+
+    no_change_streak = 0
+    prev_raw: str | None = None
+
+    for click_n in range(MAX_TF_CLICKS):
+        raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_TIMEFRAME)
+        if not raw:
+            logger.warning("select_periscope_timeframe: timeframe display not found in DOM")
+            return False
+        current = _parse_timeframe_start(raw)
+        if current is None:
+            logger.warning("select_periscope_timeframe: cannot parse timeframe %r", raw)
+            return False
+        logger.debug("select_periscope_timeframe: %r → %02d:%02d (target %02d:%02d)",
+                     raw, current[0], current[1], target_hour, target_minute)
+        if current == (target_hour, target_minute):
+            logger.info("Periscope timeframe set to %02d:%02d", target_hour, target_minute)
+            return True
+
+        # If the last click produced no change, count it. Two consecutive no-changes = boundary.
+        if raw == prev_raw:
+            no_change_streak += 1
+            if no_change_streak >= 2:
+                logger.warning(
+                    "select_periscope_timeframe: timeframe stuck at %r after %d clicks — "
+                    "%02d:%02d not available or button not found",
+                    raw, click_n, target_hour, target_minute,
+                )
+                return False
+        else:
+            no_change_streak = 0
+        prev_raw = raw
+
+        curr_mins = current[0] * 60 + current[1]
+        tgt_mins  = target_hour * 60 + target_minute
+        direction = "prev" if curr_mins > tgt_mins else "next"
+        result = _cdp_evaluate(ws_url, _JS_CLICK_TIMEFRAME_NAV % _json3.dumps(direction))
+        if result not in ("clicked",):
+            logger.warning("select_periscope_timeframe: %s click result %r — aborting", direction, result)
+            return False
+        # Poll up to 3 s for the timeframe DOM to update
+        for _ in range(6):
+            _time.sleep(0.5)
+            new_raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_TIMEFRAME)
+            if new_raw and new_raw != raw:
+                break
+
+    logger.warning(
+        "select_periscope_timeframe: could not reach %02d:%02d after %d clicks",
+        target_hour, target_minute, MAX_TF_CLICKS,
+    )
+    return False
+
+
 def select_periscope_date_all(target_date: date) -> None:
     """Navigate all known Periscope tabs (market-exposure and market-tide) to target_date."""
     for url in [_PERISCOPE_MARKET_EXPOSURE_URL, _PERISCOPE_MARKET_TIDE_URL]:
@@ -683,6 +862,17 @@ def capture_periscope_for_backtest(
     if select_periscope_datetime(target_date=target_date, target_hour=target_hour):
         ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
         if ws_url:
+            # Navigate the GEX bar-chart timeframe selector to the target hour window.
+            # select_periscope_datetime only scrolls the price chart; the GEX snapshot
+            # shown in the bar chart is controlled by the separate timeframe picker.
+            if not select_periscope_timeframe(ws_url, target_hour=target_hour, target_minute=0):
+                logger.warning(
+                    "capture_periscope_for_backtest: could not set timeframe to %02d:00 "
+                    "for %s — screenshot will use whatever window was active",
+                    target_hour, target_date,
+                )
+            # DOM text updates before chart bars finish rendering — wait for bars to settle.
+            _time.sleep(3.0)
             out_path = snapshot_dir / f"{date_str}_{target_hour:02d}h_periscope_market_exposure.png"
             for attempt in range(1, 4):
                 ws_url = _cdp_ws_for_tab(_PERISCOPE_MARKET_EXPOSURE_URL)
@@ -767,6 +957,28 @@ class TradeManager:
 
         stop_price  = verdict.stop_level or entry_price * (1 - self._stop_buffer_pct / 100)
         target_price = verdict.target_level or entry_price * (1 + self._target_pct / 100)
+
+        # Require reward ≥ risk before placing any order
+        if (target_price - entry_price) < (entry_price - stop_price):
+            logger.warning(
+                "Entry blocked — bad R/R: target +%.2f < stop dist %.2f (entry=%.2f stop=%.2f target=%.2f)",
+                target_price - entry_price, entry_price - stop_price,
+                entry_price, stop_price, target_price,
+            )
+            return False
+
+        # Stop must be wide enough for current VIX noise level.
+        # VIX / 10 gives a rough intraday SPY floor (VIX 28 → $2.80 minimum).
+        vix_now = signal.snapshot.vix
+        if vix_now is not None:
+            min_stop_dist = vix_now / 10.0
+            stop_dist = entry_price - stop_price
+            if stop_dist < min_stop_dist:
+                logger.warning(
+                    "Entry blocked — stop $%.2f < VIX-floor $%.2f (VIX=%.1f)",
+                    stop_dist, min_stop_dist, vix_now,
+                )
+                return False
 
         quantity = max(1, int(self._max_amm / entry_price))
         limit_price = round(entry_price * 1.001, 2)  # small slip above current price

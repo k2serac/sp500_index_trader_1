@@ -27,7 +27,7 @@ from libs import (
     MarketDataFeed, SignalEvaluator, ClaudeAnalyst,
     TradeManager, TradingJournal, open_uw_browser, capture_periscope_screenshots,
     select_periscope_datetime, select_periscope_date_all,
-    PeriscopeReader,
+    PeriscopeReader, PeriscopeParseError,
     is_rth, minutes_since_open, in_trading_window, in_periscope_window,
 )
 
@@ -78,7 +78,8 @@ SUPPORT_BUFFER_PCT  = _cfg["signals"]["support_buffer_pct"]
 USE_CLAUDE          = _cfg["claude"]["use_claude"]
 CLAUDE_MODEL        = _cfg["claude"]["model"]
 
-PERISCOPE_DIR = Path(_cfg["periscope"]["snapshot_dir"])
+PERISCOPE_DIR         = Path(_cfg["periscope"]["snapshot_dir"])
+PERISCOPE_READ_RETRIES = _cfg["periscope"].get("read_retries", 1)
 
 # Minimum conditions required to call Claude
 MIN_CONDITIONS_FOR_CLAUDE = 3
@@ -96,6 +97,16 @@ def _sleep(secs: float) -> None:
         if remaining <= 0:
             break
         time.sleep(min(1.0, remaining))
+
+
+def _next_session_wake(now: datetime, trade_hour: "TradeHour") -> datetime:
+    """Return the 9:20 ET datetime of the next trading day after now."""
+    search_from = 0 if now.time() < dt_time(9, 21) else 1
+    for offset in range(search_from, search_from + 8):
+        candidate = now + pd.Timedelta(days=offset)
+        if trade_hour.is_trading_day(candidate):
+            return candidate.replace(hour=9, minute=20, second=0, microsecond=0)
+    return now + pd.Timedelta(days=7)  # safety fallback
 
 
 def main() -> None:
@@ -148,6 +159,7 @@ def main() -> None:
     loop_count = 0
     last_screenshot_window: datetime | None = None  # tracks the last 10-min bucket screenshotted
     latest_periscope_data = None
+    latest_periscope_date: date | None = None       # date of the last successful Periscope read
     latest_periscope_shots: dict = {}
 
     try:
@@ -158,19 +170,7 @@ def main() -> None:
 
                 # --- Idle sleep: only active 9:21–16:00 ET on trading days ---
                 if not in_periscope_window(now) or not trade_hour.is_trading_day():
-                    # Search for next trading day from today if before 9:21, else from tomorrow
-                    # (handles the after-16:00 case where today's 9:20 is already in the past).
-                    search_from = 0 if now.time() < dt_time(9, 21) else 1
-                    wake_at = None
-                    for offset in range(search_from, search_from + 8):
-                        candidate = now + pd.Timedelta(days=offset)
-                        if trade_hour.is_trading_day(candidate):
-                            wake_at = candidate.replace(hour=9, minute=20, second=0, microsecond=0)
-                            break
-
-                    if wake_at is None:
-                        wake_at = now + pd.Timedelta(days=7)  # safety fallback
-
+                    wake_at = _next_session_wake(now, trade_hour)
                     secs = (wake_at - now).total_seconds()
                     if secs > LOOP_INTERVAL_SECS:
                         logger.info("Market inactive — sleeping until %s (%.1f hr).",
@@ -185,9 +185,45 @@ def main() -> None:
                     shots = capture_periscope_screenshots(PERISCOPE_DIR)
                     last_screenshot_window = current_window
                     if shots:
-                        periscope_data = periscope_reader.read(shots)
-                        if periscope_data is not None:
+                        periscope_data = None
+                        max_attempts = 1 + PERISCOPE_READ_RETRIES
+                        for attempt in range(1, max_attempts + 1):
+                            try:
+                                periscope_data = periscope_reader.read(shots)
+                            except PeriscopeParseError as exc:
+                                logger.warning(
+                                    "Periscope parse error (attempt %d/%d): %s",
+                                    attempt, max_attempts, exc,
+                                )
+                                periscope_data = None
+                            if periscope_data is not None:
+                                break
+                            if attempt < max_attempts:
+                                logger.info(
+                                    "Periscope read returned no data (attempt %d/%d) — retaking screenshot...",
+                                    attempt, max_attempts,
+                                )
+                                shots = capture_periscope_screenshots(PERISCOPE_DIR)
+                        if periscope_data is None:
+                            if latest_periscope_date != now.date():
+                                # First read of the day failed — no GEX basis to trade on.
+                                wake_at = _next_session_wake(now, trade_hour)
+                                secs = (wake_at - now).total_seconds()
+                                logger.critical(
+                                    "Periscope first read of the day failed after %d attempt(s) "
+                                    "— skipping today's session. Resuming %s.",
+                                    max_attempts,
+                                    wake_at.strftime("%Y-%m-%d %H:%M ET"),
+                                )
+                                _sleep(secs)
+                            else:
+                                logger.error(
+                                    "Periscope read failed after %d attempt(s) — keeping last known data.",
+                                    max_attempts,
+                                )
+                        else:
                             latest_periscope_data = periscope_data
+                            latest_periscope_date = now.date()
                             latest_periscope_shots = shots
                             logger.info("Periscope update:\n%s", periscope_data.summary())
                             evaluator.update_support_levels(periscope_data.all_key_levels_spy())
@@ -211,6 +247,11 @@ def main() -> None:
                         trader.close_all(reason="pre-close sweep")
 
                 # --- Only look for new entries within the trading window ---
+                if latest_periscope_data is None:
+                    logger.debug("No Periscope data yet — skipping signal evaluation.")
+                    _sleep(LOOP_INTERVAL_SECS)
+                    continue
+
                 if not in_trading_window(now, TRADING_START_MIN, TRADING_END_MIN):
                     logger.debug("Outside trading window — skipping signal evaluation.")
                     _sleep(LOOP_INTERVAL_SECS)

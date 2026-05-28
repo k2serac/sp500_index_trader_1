@@ -35,7 +35,7 @@ from zoneinfo import ZoneInfo
 from ib_async import IB, Index, Stock
 
 from libs import (
-    PeriscopeReader, SignalEvaluator,
+    PeriscopeReader, PeriscopeParseError, SignalEvaluator,
     open_uw_browser, capture_periscope_for_backtest,
 )
 from libs.signal_lib import Bar, MarketSnapshot
@@ -310,10 +310,48 @@ def simulate_day(
                 logger.info("  %s SKIPPED (below gamma flip + charm_bias=bearish)", bt.strftime("%H:%M"))
                 continue
 
-        # Signal fired — open simulated position
+        # Signal fired — compute levels then apply pre-entry filters
         entry = bar.close
         target, t_confluence, t_sources, t_method = pick_target(entry, pdata)
         stop,   s_sources,   s_method              = pick_stop(entry, pdata)
+
+        stop_dist   = entry - stop
+        target_dist = target - entry
+
+        # Filter A: require reward ≥ risk (1:1 minimum R/R)
+        if target_dist < stop_dist:
+            logger.info(
+                "  %s SKIPPED (R/R %.2f:1 — target +%.2f < stop dist %.2f)",
+                bt.strftime("%H:%M"), target_dist / stop_dist if stop_dist else 0,
+                target_dist, stop_dist,
+            )
+            continue
+
+        # Filter B: skip tight stops when Market Tide shows SPX/Tide divergence
+        # (tight stop = within $1 of entry; divergence = tide and price moving opposite)
+        if (
+            pdata is not None
+            and pdata.spx_tide_divergence
+            and stop_dist < 1.00
+        ):
+            logger.info(
+                "  %s SKIPPED (tight stop $%.2f + tide divergence)",
+                bt.strftime("%H:%M"), stop_dist,
+            )
+            continue
+
+        # Filter C: stop must be wide enough for current VIX noise level.
+        # VIX represents annualised vol; dividing by 10 gives a rough intraday
+        # SPY floor (VIX 28 → $2.80 minimum stop distance).
+        # A stop closer than this will be hit by normal intraday noise, not signal.
+        if vix_now is not None:
+            min_stop_dist = vix_now / 10.0
+            if stop_dist < min_stop_dist:
+                logger.info(
+                    "  %s SKIPPED (stop $%.2f < VIX-floor $%.2f  VIX=%.1f)",
+                    bt.strftime("%H:%M"), stop_dist, min_stop_dist, vix_now,
+                )
+                continue
 
         position = {
             "entry_time":       bt,
@@ -469,8 +507,11 @@ def _date_range(start: date, end: date) -> list[date]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="SP500 Reversal Backtest")
     parser.add_argument("--mode", choices=["demo", "live"], default="demo")
-    parser.add_argument("--start-date", metavar="YYYY-MM-DD", help="First date to backtest (inclusive)")
-    parser.add_argument("--end-date",   metavar="YYYY-MM-DD", help="Last date to backtest (inclusive)")
+    parser.add_argument("--start-date", metavar="YYYY-MM-DD", nargs="+",
+                        help="Date(s) to backtest. One date: treated as start of range. "
+                             "Multiple dates: run exactly those days (--end-date must not be used).")
+    parser.add_argument("--end-date",   metavar="YYYY-MM-DD",
+                        help="Last date of range (inclusive). Omit when --start-date is a single date to run that day only.")
     parser.add_argument("--periscope-hour", type=int, default=DEFAULT_PERISCOPE_HOUR, metavar="H",
                         help=f"Hour ET for the Periscope GEX snapshot (default {DEFAULT_PERISCOPE_HOUR} = pre/at open)")
     parser.add_argument("--start-hour", type=int, default=DEFAULT_START_HOUR, metavar="H",
@@ -491,19 +532,45 @@ def main() -> None:
 
     port = IBKR_PORT_DEMO if args.mode == "demo" else IBKR_PORT_LIVE
 
-    # Resolve date range
+    # Resolve trading days from the date arguments.
     today = date.today()
-    start_date = date.fromisoformat(args.start_date) if args.start_date else today
-    end_date   = date.fromisoformat(args.end_date)   if args.end_date   else today
-    trading_days = _date_range(start_date, end_date)
+    start_dates_raw: list[str] = args.start_date or [today.isoformat()]
+
+    if len(start_dates_raw) > 1:
+        if args.end_date:
+            parser.error("--end-date cannot be used when --start-date has multiple values.")
+        try:
+            trading_days = sorted({date.fromisoformat(d) for d in start_dates_raw})
+        except ValueError as exc:
+            parser.error(f"Invalid date in --start-date: {exc}")
+    else:
+        try:
+            start_date = date.fromisoformat(start_dates_raw[0])
+        except ValueError as exc:
+            parser.error(f"Invalid --start-date: {exc}")
+        if args.end_date:
+            try:
+                end_date = date.fromisoformat(args.end_date)
+            except ValueError as exc:
+                parser.error(f"Invalid --end-date: {exc}")
+            if end_date < start_date:
+                parser.error(f"--end-date {end_date} is earlier than --start-date {start_date}.")
+        else:
+            end_date = start_date
+        trading_days = _date_range(start_date, end_date)
 
     if not trading_days:
         logger.error("No trading days in the requested range.")
         return
 
+    days_desc = (
+        ", ".join(str(d) for d in trading_days)
+        if len(start_dates_raw) > 1
+        else f"{trading_days[0]} → {trading_days[-1]}"
+    )
     logger.info(
-        "Backtesting %d day(s) [%s → %s]  periscope=%02d:00  eval=%02d:00–%02d:00 ET%s",
-        len(trading_days), start_date, end_date,
+        "Backtesting %d day(s) [%s]  periscope=%02d:00  eval=%02d:00–%02d:00 ET%s",
+        len(trading_days), days_desc,
         args.periscope_hour, args.start_hour, args.end_hour,
         "  [no-browser: using pre-saved dirs]" if args.no_browser else "",
     )
@@ -552,54 +619,26 @@ def main() -> None:
                         shots[slug] = sibling
             else:
                 # --- Live capture mode: navigate browser to date/hour ---
-                # Re-use existing screenshot if already captured for this date+hour
-                existing = _pick_exposure_shot(history_dir, date_str, ph)
-                if existing:
-                    logger.info("  Re-using existing screenshot: %s", existing.name)
-                    hour_prefix = existing.name.rsplit("periscope_market_exposure", 1)[0]
-                    shots = {"periscope_market_exposure": existing}
-                    for slug, suffix in [
-                        ("periscope_delta_flow", "periscope_delta_flow.png"),
-                        ("flow_overview",        "flow_overview.png"),
-                    ]:
-                        sibling = history_dir / f"{hour_prefix}{suffix}"
-                        if sibling.exists():
-                            shots[slug] = sibling
-                    tide_path = history_dir / f"{date_str}_market_tide.png"
-                    if tide_path.exists() and "flow_overview" not in shots:
-                        shots["flow_overview"] = tide_path
-                else:
-                    logger.info("  Capturing Periscope at %s %02d:00...", date_fmt, ph)
-                    shots = capture_periscope_for_backtest(history_dir, target_date, ph)
-                    if not shots.get("periscope_market_exposure"):
-                        logger.warning("Browser capture failed for %s — skipping.", date_fmt)
-                        skipped.append(date_fmt)
-                        continue
+                logger.info("  Capturing Periscope at %s %02d:00...", date_fmt, ph)
+                shots = capture_periscope_for_backtest(history_dir, target_date, ph)
+                if not shots.get("periscope_market_exposure"):
+                    logger.warning("Browser capture failed for %s — skipping.", date_fmt)
+                    skipped.append(date_fmt)
+                    continue
 
-            pdata = reader.read(shots)
-            if pdata is None and not args.no_browser:
-                # 9am slot may be sparse; retry at 10am before giving up.
-                fallback_hour = 10
-                if fallback_hour != ph:
-                    logger.info(
-                        "  PeriscopeReader returned None at %02d:00 — retrying at %02d:00",
-                        ph, fallback_hour,
-                    )
-                    retry_shots = capture_periscope_for_backtest(history_dir, target_date, fallback_hour)
-                    if retry_shots.get("periscope_market_exposure"):
-                        shots = retry_shots
-                        pdata = reader.read(retry_shots)
+            try:
+                pdata = reader.read(shots)
+            except PeriscopeParseError as exc:
+                # Claude returned non-empty text that couldn't be parsed as JSON.
+                # This is a prompt/model issue — abort so it gets investigated.
+                raise RuntimeError(
+                    f"PeriscopeReader JSON parse error for {date_fmt}: {exc}. "
+                    f"Fix the prompt or model response before continuing the backtest."
+                ) from exc
             if pdata is None:
-                if shots.get("periscope_market_exposure"):
-                    # Screenshot exists but Claude could not parse it — this is a
-                    # code or model issue, not missing data. Abort rather than skip
-                    # to avoid corrupting the analysis with an undetected blind spot.
-                    raise RuntimeError(
-                        f"PeriscopeReader returned None for {date_fmt} despite a valid "
-                        f"screenshot. Periscope data is visible but unreadable — fix the "
-                        f"issue before continuing the backtest."
-                    )
-                logger.warning("No Periscope screenshot for %s — skipping.", date_fmt)
+                # Claude returned empty response — chart has no GEX data at this hour.
+                # Legitimate condition (e.g. pre-market, zero-GEX day) — skip cleanly.
+                logger.warning("No GEX data from Periscope for %s — skipping.", date_fmt)
                 skipped.append(date_fmt)
                 continue
 
@@ -641,11 +680,11 @@ def main() -> None:
         ib.disconnect()
         logger.info("IBKR disconnected.")
 
-    _save_json(results, no_signal, skipped, args)
+    _save_json(results, no_signal, skipped, args, trading_days)
     _print_summary(results, no_signal, skipped)
 
 
-def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], args) -> None:
+def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], args, trading_days: list) -> None:
     import json
     out_dir = Path("journal") / "backtest"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -654,8 +693,7 @@ def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], ar
     payload = {
         "run_at":       datetime.now(MARKET_TZ).isoformat(),
         "params": {
-            "start_date":  args.start_date,
-            "end_date":    args.end_date,
+            "dates":       [str(d) for d in trading_days],
             "start_hour":  args.start_hour,
             "end_hour":    args.end_hour,
         },

@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 MARKET_TZ = ZoneInfo("America/New_York")
 
+
+class PeriscopeParseError(Exception):
+    """Claude returned a non-empty response that could not be parsed as JSON.
+
+    Indicates a prompt or model issue — distinct from an empty response
+    (chart has no GEX data) which is a legitimate no-data condition.
+    """
+
 _SYSTEM_PROMPT = """\
 You are a quantitative analyst reading UnusualWhales Periscope screenshots to extract
 structured market-maker positioning data for an intraday SPX/SPY mean-reversion strategy.
@@ -251,11 +259,14 @@ class PeriscopeReader:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=1024,
+                temperature=0,
                 system=_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": content}],
             )
             raw = response.content[0].text
             data = self._parse(raw)
+        except PeriscopeParseError:
+            raise  # propagate — caller decides whether to abort or skip
         except Exception as exc:
             logger.error("PeriscopeReader: Claude call failed: %s", exc)
             return None
@@ -289,6 +300,7 @@ class PeriscopeReader:
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=256,
+                temperature=0,
                 system=_TIDE_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": [
                     {"type": "text", "text": "Market Tide screenshot:"},
@@ -301,7 +313,12 @@ class PeriscopeReader:
                 raw = raw.split("```")[1]
                 if raw.startswith("json"):
                     raw = raw[4:]
-            tide = json.loads(raw.strip())
+            raw = raw.strip()
+            brace_open  = raw.find("{")
+            brace_close = raw.rfind("}")
+            if brace_open >= 0 and brace_close >= 0:
+                raw = raw[brace_open:brace_close + 1]
+            tide = json.loads(raw)
         except Exception as exc:
             logger.warning("PeriscopeReader: Market Tide Claude call failed: %s", exc)
             return
@@ -316,17 +333,36 @@ class PeriscopeReader:
                     data.tide_turning, data.spx_tide_divergence)
 
     def _parse(self, raw: str) -> PeriscopeData | None:
+        text = raw.strip()
+        if not text:
+            logger.warning("PeriscopeReader: Claude returned empty response — chart likely has no GEX data")
+            return None
         try:
             # Strip markdown code fences if present
-            text = raw.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
                 if text.startswith("json"):
                     text = text[4:]
-            data = json.loads(text.strip())
+            text = text.strip()
+            # If Claude prefixed/suffixed with prose, extract just the JSON object
+            brace_open  = text.find("{")
+            brace_close = text.rfind("}")
+            if brace_open > 0 or (brace_close >= 0 and brace_close < len(text) - 1):
+                logger.warning(
+                    "PeriscopeReader: JSON wrapped in prose (preamble=%d trailing=%d) — extracting",
+                    brace_open, len(text) - brace_close - 1,
+                )
+                text = text[brace_open:brace_close + 1] if brace_open >= 0 and brace_close >= 0 else text
+            if not text or not text.startswith("{"):
+                logger.warning(
+                    "PeriscopeReader: no JSON object in response — chart likely has no GEX data. Raw: %.200s",
+                    raw,
+                )
+                return None
+            data = json.loads(text)
         except json.JSONDecodeError as exc:
-            logger.error("PeriscopeReader: could not parse JSON response: %s\n%s", exc, raw)
-            return None
+            logger.error("PeriscopeReader: could not parse JSON response: %s\nRaw: %s", exc, raw[:500])
+            raise PeriscopeParseError(str(exc)) from exc
 
         def floats(key: str) -> list[float]:
             return [float(v) for v in data.get(key) or []]
