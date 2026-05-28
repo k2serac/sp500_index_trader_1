@@ -418,7 +418,7 @@ def select_periscope_datetime(
     if target_date is not None:
         import json as _json2
         visited: set[date] = set()
-        for _ in range(30):  # safety cap: max 30 single-day clicks
+        for _ in range(60):  # safety cap: oscillation detection is the real guard now
             raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_DATE)
             if not raw:
                 logger.warning("select_periscope_datetime: cannot read current date from page")
@@ -457,7 +457,7 @@ def select_periscope_datetime(
                 if new_raw and new_raw != raw:
                     break
         else:
-            logger.warning("select_periscope_datetime: could not reach %s after 30 clicks", target_date)
+            logger.warning("select_periscope_datetime: could not reach %s after 60 clicks", target_date)
             return False
         logger.info("Periscope date set to %s", target_date)
 
