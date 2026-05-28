@@ -587,9 +587,19 @@ def main() -> None:
                     )
                     retry_shots = capture_periscope_for_backtest(history_dir, target_date, fallback_hour)
                     if retry_shots.get("periscope_market_exposure"):
+                        shots = retry_shots
                         pdata = reader.read(retry_shots)
             if pdata is None:
-                logger.warning("PeriscopeReader returned None for %s — skipping.", date_fmt)
+                if shots.get("periscope_market_exposure"):
+                    # Screenshot exists but Claude could not parse it — this is a
+                    # code or model issue, not missing data. Abort rather than skip
+                    # to avoid corrupting the analysis with an undetected blind spot.
+                    raise RuntimeError(
+                        f"PeriscopeReader returned None for {date_fmt} despite a valid "
+                        f"screenshot. Periscope data is visible but unreadable — fix the "
+                        f"issue before continuing the backtest."
+                    )
+                logger.warning("No Periscope screenshot for %s — skipping.", date_fmt)
                 skipped.append(date_fmt)
                 continue
 
