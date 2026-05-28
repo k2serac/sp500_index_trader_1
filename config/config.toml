@@ -46,3 +46,8 @@ context_dir = "config/context"
 [periscope]
 # Screenshots taken 1 min after each 10-min Periscope update (:01, :11, :21, ...)
 snapshot_dir = "periscope_snapshots"
+
+# Maximum single-day button clicks when navigating to a historical date.
+# Oscillation detection is the primary safety guard; this is a hard backstop.
+# Increase if backtesting dates more than ~60 trading days back from today.
+max_nav_clicks = 60

@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import subprocess
+import tomllib
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -18,6 +19,15 @@ from zoneinfo import ZoneInfo
 from ib_async import IB, LimitOrder, MarketOrder, Stock, StopOrder
 
 logger = logging.getLogger(__name__)
+
+_CONFIG_FILE = Path("config/config.toml")
+try:
+    with open(_CONFIG_FILE, "rb") as _f:
+        _cfg = tomllib.load(_f)
+except FileNotFoundError:
+    _cfg = {}
+
+_MAX_NAV_CLICKS: int = _cfg.get("periscope", {}).get("max_nav_clicks", 60)
 
 _UW_BOOKMARK_FOLDER = "UnusualWhales"
 _CHROME_BOOKMARKS = Path.home() / ".config/google-chrome/Default/Bookmarks"
@@ -418,7 +428,7 @@ def select_periscope_datetime(
     if target_date is not None:
         import json as _json2
         visited: set[date] = set()
-        for _ in range(60):  # safety cap: oscillation detection is the real guard now
+        for _ in range(_MAX_NAV_CLICKS):
             raw = _cdp_evaluate(ws_url, _JS_GET_PERISCOPE_DATE)
             if not raw:
                 logger.warning("select_periscope_datetime: cannot read current date from page")
@@ -457,7 +467,11 @@ def select_periscope_datetime(
                 if new_raw and new_raw != raw:
                     break
         else:
-            logger.warning("select_periscope_datetime: could not reach %s after 60 clicks", target_date)
+            logger.error(
+                "select_periscope_datetime: could not reach %s after %d clicks "
+                "(max_nav_clicks in config.toml) — Periscope may not have data that far back",
+                target_date, _MAX_NAV_CLICKS,
+            )
             return False
         logger.info("Periscope date set to %s", target_date)
 
