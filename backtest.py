@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 import tomllib
 from collections import defaultdict
@@ -71,6 +72,15 @@ DEFAULT_START_HOUR   = 10     # skip first 30 min of open chop (matches TRADING_
 DEFAULT_END_HOUR     = 15     # simulation stops at 15:55
 PRECLOSE_TIME        = dt_time(15, 55)
 GREEK_TOLERANCE      = 5.0   # pts — levels within this are treated as the same zone
+
+# Instrument / position-sizing constants
+_TRADING_HRS        = 6.5     # RTH session length (9:30–16:00)
+_RISK_FREE_RATE     = 0.05    # annualised, used for BS options pricing
+ES_POINT_VALUE      = 50      # $ per SPX point (E-mini S&P 500)
+MES_POINT_VALUE     = 5       # $ per SPX point (Micro E-mini)
+ES_MARGIN           = 14_000  # approximate initial margin per ES contract
+MES_MARGIN          = 1_400   # approximate initial margin per MES contract
+SPY_TO_SPX          = 10.0    # SPY price * 10 ≈ SPX (holds since SPY's 1993 launch)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +163,62 @@ def pick_stop(entry: float, pdata) -> tuple[float, list[str], str]:
 
 
 # ---------------------------------------------------------------------------
+# Instrument P&L modelling
+# ---------------------------------------------------------------------------
+
+def _bs_call(S: float, K: float, T: float, r: float, sigma: float) -> float:
+    """Black-Scholes price for a European call option."""
+    if T <= 0:
+        return max(S - K, 0.0)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    N = lambda x: 0.5 * (1.0 + math.erf(x / math.sqrt(2)))
+    return S * N(d1) - K * math.exp(-r * T) * N(d2)
+
+
+def _instrument_pnl(result: dict, instrument: str, capital: float) -> tuple[float, int, str]:
+    """
+    Compute dollar P&L and position size for the chosen instrument.
+    Returns (pnl_dollars, size, detail_str).
+    """
+    entry    = result["entry_price"]
+    exit_p   = result["exit_price"]
+    move     = exit_p - entry
+    vix      = result.get("vix_at_entry") or 20.0  # fallback when VIX was unavailable
+
+    if instrument == "spy":
+        size = int(capital / entry)
+        return size * move, size, f"{size} sh"
+
+    elif instrument == "options":
+        sigma   = vix / 100.0
+        K       = round(entry)
+        # Hours remaining until 16:00 close, converted to fraction of trading year
+        def _hr(t: str) -> float:
+            h, m = map(int, t.split(":"))
+            return h + m / 60.0
+        T_entry = (16.0 - _hr(result["entry_time"])) / (_TRADING_HRS * 252)
+        T_exit  = (16.0 - _hr(result["exit_time"]))  / (_TRADING_HRS * 252)
+        C_entry = _bs_call(entry, K, T_entry, _RISK_FREE_RATE, sigma)
+        C_exit  = _bs_call(exit_p, K, max(T_exit, 0), _RISK_FREE_RATE, sigma)
+        size    = int(capital / (C_entry * 100)) if C_entry > 0 else 0
+        pnl     = size * (C_exit - C_entry) * 100
+        return pnl, size, f"{size} ctrs  prem ${C_entry:.2f}→${C_exit:.2f}"
+
+    elif instrument == "es":
+        size    = max(1, int(capital / ES_MARGIN))
+        spx_move = move * SPY_TO_SPX
+        return size * spx_move * ES_POINT_VALUE, size, f"{size} ES"
+
+    elif instrument == "mes":
+        size    = max(1, int(capital / MES_MARGIN))
+        spx_move = move * SPY_TO_SPX
+        return size * spx_move * MES_POINT_VALUE, size, f"{size} MES"
+
+    return 0.0, 0, "unknown"
+
+
+# ---------------------------------------------------------------------------
 # IBKR data fetching
 # ---------------------------------------------------------------------------
 
@@ -203,6 +269,7 @@ def simulate_day(
     tick_raw: list,
     start_hour: int = DEFAULT_START_HOUR,
     end_hour: int = DEFAULT_END_HOUR,
+    min_target_dist: float = 0.0,
 ) -> dict | None:
     """
     Walk through a day's bars and simulate one trade within [start_hour, end_hour].
@@ -353,6 +420,15 @@ def simulate_day(
                 )
                 continue
 
+        # Filter D: minimum target distance — ensures enough room for options
+        # to overcome theta decay, or for futures/shares to justify commission.
+        if min_target_dist > 0 and target_dist < min_target_dist:
+            logger.info(
+                "  %s SKIPPED (target_dist $%.2f < min $%.2f)",
+                bt.strftime("%H:%M"), target_dist, min_target_dist,
+            )
+            continue
+
         position = {
             "entry_time":       bt,
             "entry_price":      entry,
@@ -370,6 +446,7 @@ def simulate_day(
             "vol_exhaust":      signal.volume_exhaustion,
             "candle_ok":        signal.candle_structure,
             "support_level":    signal.support_level,
+            "vix_at_entry":     vix_now,
         }
         logger.info(
             "  %s ENTRY %.2f  stop=%.2f [%s]  target=%.2f [%s conf=%d]  conds=%d/5",
@@ -428,6 +505,7 @@ def _result(
         # --- Outcome ---
         "pnl_per_share":      round(exit_price - entry, 2),
         "pnl_pct":            round((exit_price - entry) / entry * 100, 3),
+        "vix_at_entry":       pos.get("vix_at_entry"),
         # --- Signal conditions ---
         "conditions_met":     pos["conditions_met"],
         "tick_flush":         pos["tick_flush"],
@@ -520,6 +598,15 @@ def main() -> None:
                         help=f"Hour ET to stop entries / force exit (default {DEFAULT_END_HOUR})")
     parser.add_argument("--no-browser", action="store_true",
                         help="Skip browser capture; read from pre-saved history_YYYYMMDD/ dirs")
+    parser.add_argument("--instrument", default="spy",
+                        choices=["spy", "options", "es", "mes"],
+                        help="Instrument for P&L calculation: spy (shares), options (0DTE ATM calls), "
+                             "es (E-mini futures), mes (Micro E-mini futures).  Default: spy")
+    parser.add_argument("--capital", type=float, default=10_000,
+                        help="Per-trade capital in $ for instrument P&L sizing (default 10000)")
+    parser.add_argument("--min-target-dist", type=float, default=0.0, metavar="$",
+                        help="Filter D: minimum target distance in $ to enter a trade (default 0 = off). "
+                             "Recommended ≥5 when trading options.")
     parser.add_argument("--log-level", default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
                         help="Logging verbosity (default INFO)")
@@ -662,6 +749,7 @@ def main() -> None:
                 date_str, pdata, spy_raw, vix_raw, tick_raw,
                 start_hour=args.start_hour,
                 end_hour=args.end_hour,
+                min_target_dist=args.min_target_dist,
             )
             if result:
                 results.append(result)
@@ -681,7 +769,7 @@ def main() -> None:
         logger.info("IBKR disconnected.")
 
     _save_json(results, no_signal, skipped, args, trading_days)
-    _print_summary(results, no_signal, skipped)
+    _print_summary(results, no_signal, skipped, args.instrument, args.capital, args.min_target_dist)
 
 
 def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], args, trading_days: list) -> None:
@@ -693,9 +781,12 @@ def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], ar
     payload = {
         "run_at":       datetime.now(MARKET_TZ).isoformat(),
         "params": {
-            "dates":       [str(d) for d in trading_days],
-            "start_hour":  args.start_hour,
-            "end_hour":    args.end_hour,
+            "dates":           [str(d) for d in trading_days],
+            "start_hour":      args.start_hour,
+            "end_hour":        args.end_hour,
+            "instrument":      args.instrument,
+            "capital":         args.capital,
+            "min_target_dist": args.min_target_dist,
         },
         "trades":       results,
         "no_signal_days": no_signal,
@@ -711,7 +802,14 @@ def _save_json(results: list[dict], no_signal: list[str], skipped: list[str], ar
     logger.info("Results saved → %s", out_path)
 
 
-def _print_summary(results: list[dict], no_signal: list[str], skipped: list[str]) -> None:
+def _print_summary(
+    results: list[dict],
+    no_signal: list[str],
+    skipped: list[str],
+    instrument: str = "spy",
+    capital: float = 10_000,
+    min_target_dist: float = 0.0,
+) -> None:
     W = 90
     print("\n" + "=" * W)
     print("BACKTEST RESULTS")
@@ -748,6 +846,39 @@ def _print_summary(results: list[dict], no_signal: list[str], skipped: list[str]
             print(f"  Avg win  : {sum(r['pnl_per_share'] for r in wins)/len(wins):+.2f}")
         if losses:
             print(f"  Avg loss : {sum(r['pnl_per_share'] for r in losses)/len(losses):+.2f}")
+
+        # --- Instrument P&L section ---
+        inst_label = {
+            "spy":     "SPY shares",
+            "options": "SPY 0DTE ATM calls",
+            "es":      "ES E-mini futures",
+            "mes":     "MES Micro E-mini futures",
+        }.get(instrument, instrument)
+
+        print(f"\n  Instrument P&L  [{inst_label}  ${capital:,.0f}/trade"
+              + (f"  min-target ${min_target_dist:.2f}" if min_target_dist else "") + "]")
+        print(f"  {'Date':<12} {'P&L/sh':>7}  {'$ P&L':>9}  Size / detail")
+        print("  " + "-" * 60)
+
+        total_inst = 0.0
+        inst_wins = 0
+        for r in results:
+            pnl_inst, size, detail = _instrument_pnl(r, instrument, capital)
+            total_inst += pnl_inst
+            if pnl_inst > 0:
+                inst_wins += 1
+            sign = "+" if pnl_inst >= 0 else ""
+            sh_sign = "+" if r["pnl_per_share"] >= 0 else ""
+            print(
+                f"  {r['date']:<12} {sh_sign}{r['pnl_per_share']:>6.2f}  "
+                f"{sign}{pnl_inst:>8,.0f}  {detail}"
+            )
+        print("  " + "-" * 60)
+        sign = "+" if total_inst >= 0 else ""
+        ret  = total_inst / capital * 100
+        print(f"  Total $ P&L : {sign}${total_inst:,.0f}")
+        print(f"  Return/trade: {sign}{ret:.1f}% on ${capital:,.0f}")
+        print(f"  Win rate    : {inst_wins}/{len(results)} ({inst_wins/len(results)*100:.0f}%)")
     else:
         print("  No trades fired across all days.")
 
