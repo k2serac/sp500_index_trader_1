@@ -29,6 +29,7 @@ from libs import (
     select_periscope_datetime, select_periscope_date_all,
     PeriscopeReader, PeriscopeParseError,
     is_rth, minutes_since_open, in_trading_window, in_periscope_window,
+    MARKET_TZ,
 )
 
 # ---------------------------------------------------------------------------
